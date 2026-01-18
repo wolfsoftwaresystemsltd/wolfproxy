@@ -595,14 +595,19 @@ async fn handle_request(
             
             return serve_static_file(file_path, &loc.index, &vhost.index, &vhost.error_pages).await;
         }
+        
+        // No proxy_pass and no root - nothing to serve
+        warn!("Location '{}' matched but has no proxy_pass or root", loc.path);
     } else {
         // No matching location, try serving from root
+        warn!("No location matched for path: {}", uri_path);
         if let Some(root) = &vhost.root {
             let file_path = root.join(uri_path.trim_start_matches('/'));
             return serve_static_file(file_path, &[], &vhost.index, &vhost.error_pages).await;
         }
     }
     
+    warn!("Returning 404 Not Found - no handler for request");
     (StatusCode::NOT_FOUND, "Not Found").into_response()
 }
 
