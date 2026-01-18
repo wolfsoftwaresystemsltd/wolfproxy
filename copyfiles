@@ -1,44 +1,45 @@
 #!/bin/bash
-# Copy WolfProxy files to a remote server
-# (C) 2025 Wolf Software Systems Ltd
+# Copy WolfProxy source and config files for remote building
+# (C) 2026 Wolf Software Systems Ltd
 
-set -e
+# Files needed to build and run wolfproxy
+FILES="src Cargo.toml install_service.sh wolfproxy.toml wolfproxy.toml.example build.sh run.sh LICENSE README.md"
 
-if [ "$#" -lt 1 ]; then
-    echo "Usage: $0 <user@host> [remote_path]"
-    echo "Example: $0 root@server.example.com /opt/wolfproxy"
-    exit 1
-fi
+# Target servers
+SERVERS=(
+    "root@100.123.22.10:/mnt/shared/wolfproxy"
+    "root@wolf-grid.com:/root/wolfproxy"
+    "root@100.83.218.9:/mnt/shared/wolfproxy"
+)
 
-REMOTE_HOST="$1"
-REMOTE_PATH="${2:-/opt/wolfproxy}"
+echo "WolfProxy Remote Deployment"
+echo "==========================="
+echo ""
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Cleanup remote targets to avoid GLIBC conflicts
+echo "Cleanup remote target directories to avoid GLIBC conflicts..."
+for target in "${SERVERS[@]}"; do
+    server="${target%:*}"
+    path="${target#*:}"
+    echo "  Cleaning $server:$path/target..."
+    ssh "$server" "rm -rf $path/target" 2>/dev/null || true
+done
+echo ""
 
-# Check if binary exists
-if [ ! -f "$SCRIPT_DIR/target/release/wolfproxy" ]; then
-    echo "Binary not found. Building..."
-    cd "$SCRIPT_DIR"
-    cargo build --release
-fi
-
-echo "Copying WolfProxy to $REMOTE_HOST:$REMOTE_PATH..."
-
-# Create remote directory
-ssh "$REMOTE_HOST" "mkdir -p $REMOTE_PATH"
-
-# Copy files
-scp "$SCRIPT_DIR/target/release/wolfproxy" "$REMOTE_HOST:$REMOTE_PATH/"
-scp "$SCRIPT_DIR/wolfproxy.toml.example" "$REMOTE_HOST:$REMOTE_PATH/"
-scp "$SCRIPT_DIR/install_service.sh" "$REMOTE_HOST:$REMOTE_PATH/"
-scp "$SCRIPT_DIR/README.md" "$REMOTE_HOST:$REMOTE_PATH/"
-
-# Copy config if it doesn't exist on remote
-ssh "$REMOTE_HOST" "[ -f $REMOTE_PATH/wolfproxy.toml ] || cp $REMOTE_PATH/wolfproxy.toml.example $REMOTE_PATH/wolfproxy.toml"
+# Sync to all servers
+for target in "${SERVERS[@]}"; do
+    server="${target%:*}"
+    path="${target#*:}"
+    echo "Syncing to $server:$path..."
+    ssh "$server" "mkdir -p $path" 2>/dev/null || true
+    scp -r $FILES "$target/"
+done
 
 echo ""
-echo "Files copied successfully!"
+echo "Done!"
 echo ""
-echo "To install as service, SSH to the server and run:"
-echo "  cd $REMOTE_PATH"
-echo "  sudo ./install_service.sh"
+echo "To install on remote server:"
+echo "  1. SSH to the server"
+echo "  2. cd to wolfproxy directory"
+echo "  3. Run: cargo build --release"
+echo "  4. Run: sudo ./install_service.sh"
