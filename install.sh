@@ -18,13 +18,13 @@ echo " (C) 2026 Wolf Software Systems Ltd - http://wolf.uk.com"
 echo " Installation Script"
 echo ""
 
-# Source cargo environment if it exists
+# Source cargo environment if it exists (use . for POSIX compatibility)
 if [ -f "$HOME/.cargo/env" ]; then
-    source "$HOME/.cargo/env"
+    . "$HOME/.cargo/env"
 fi
 
 # Check for Rust - try common locations
-if ! command -v cargo &> /dev/null; then
+if ! command -v cargo >/dev/null 2>&1; then
     if [ -x "$HOME/.cargo/bin/cargo" ]; then
         export PATH="$HOME/.cargo/bin:$PATH"
     else
