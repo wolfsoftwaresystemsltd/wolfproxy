@@ -1,0 +1,205 @@
+# WolfProxy
+
+A high-performance Rust-based reverse proxy server that reads and uses nginx configuration files directly.
+
+**(C) 2025 Wolf Software Systems Ltd - http://wolf.uk.com**
+
+## Features
+
+- **Drop-in nginx replacement**: Reads nginx sites-enabled configuration directly
+- **Automatic SSL/TLS**: Automatically picks up SSL certificates from nginx config (Let's Encrypt, etc.)
+- **Load Balancing**: Full upstream support with multiple algorithms:
+  - Round Robin
+  - Weighted Round Robin
+  - IP Hash (sticky sessions)
+  - Least Connections
+  - Random
+- **Health Checking**: Automatic backend health monitoring with configurable thresholds
+- **SNI Support**: Proper Server Name Indication for multiple SSL domains
+- **HTTP/1.1 & HTTP/2**: Full protocol support
+
+## Supported nginx Directives
+
+### Server Block
+- `listen` - Port and SSL configuration
+- `server_name` - Virtual host names
+- `root` - Document root
+- `index` - Index files
+- `error_page` - Custom error pages
+- `ssl_certificate` / `ssl_certificate_key` - SSL certificates
+- `include` - Include other config files
+- `gzip` - Compression (header support)
+
+### Location Block
+- `location` - Path matching (prefix, exact `=`, regex `~`, case-insensitive `~*`, priority `^~`)
+- `proxy_pass` - Reverse proxy to backend or upstream
+- `proxy_set_header` - Set headers for backend
+- `proxy_http_version` - HTTP version for backend
+- `proxy_buffer_size` / `proxy_buffers` - Buffer configuration
+- `proxy_connect_timeout` / `proxy_read_timeout` / `proxy_send_timeout` - Timeouts
+- `root` / `alias` - Static file serving
+- `try_files` - Try multiple files
+- `return` - Return status codes or redirects
+- `rewrite` - URL rewriting
+- `deny` / `allow` - Access control
+- `add_header` - Add response headers
+
+### Upstream Block
+- `upstream` - Define backend server groups
+- `server` - Backend servers with options:
+  - `weight` - Server weight
+  - `max_fails` - Failure threshold
+  - `fail_timeout` - Recovery timeout
+  - `backup` - Backup server
+  - `down` - Mark server as down
+- `ip_hash` - Sticky sessions
+- `least_conn` - Least connections balancing
+- `keepalive` - Connection pooling
+
+### Conditionals
+- `if ($host = ...)` - Host-based conditions
+- `if ($request_method = ...)` - Method-based conditions
+
+## Installation
+
+### Prerequisites
+
+- Rust 1.70+ (https://rustup.rs)
+- Existing nginx configuration in `/etc/nginx/sites-enabled/`
+
+### Build
+
+```bash
+./build.sh
+```
+
+Or manually:
+
+```bash
+cargo build --release
+```
+
+### Run
+
+```bash
+./run.sh
+```
+
+Or:
+
+```bash
+./target/release/wolfproxy
+```
+
+### Install as Service
+
+```bash
+sudo ./install_service.sh
+```
+
+This will:
+1. Copy the binary to `/opt/wolfproxy/`
+2. Create a systemd service
+3. Optionally stop nginx and start WolfProxy
+
+## Configuration
+
+WolfProxy uses a simple TOML configuration file (`wolfproxy.toml`):
+
+```toml
+[server]
+host = "0.0.0.0"
+http_port = 80
+https_port = 443
+
+[nginx]
+config_dir = "/etc/nginx"
+auto_reload = false
+```
+
+The nginx configuration is read from:
+- `{config_dir}/sites-enabled/` - Site configuration files
+- `{config_dir}/conf.d/*.conf` - Additional configuration files
+
+## Example nginx Configuration
+
+WolfProxy will read standard nginx configuration like:
+
+```nginx
+upstream backend {
+    ip_hash;
+    server 10.0.10.105 max_fails=3 fail_timeout=360s;
+    server 10.0.10.102 max_fails=3 fail_timeout=360s;
+    server 10.0.10.103 max_fails=3 fail_timeout=360s;
+}
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name example.com;
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name example.com;
+
+    ssl_certificate /etc/letsencrypt/live/example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/example.com/privkey.pem;
+
+    location / {
+        proxy_pass http://backend;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+    }
+}
+```
+
+## Migration from nginx
+
+1. **Stop nginx**: `sudo systemctl stop nginx`
+2. **Install WolfProxy**: `sudo ./install_service.sh`
+3. **Start WolfProxy**: `sudo systemctl start wolfproxy`
+4. **Verify**: Check your sites are working
+5. **Disable nginx**: `sudo systemctl disable nginx`
+6. **Enable WolfProxy**: `sudo systemctl enable wolfproxy`
+
+## Logging
+
+Set the `RUST_LOG` environment variable to control log level:
+
+```bash
+RUST_LOG=debug ./target/release/wolfproxy
+```
+
+Levels: `trace`, `debug`, `info`, `warn`, `error`
+
+## Comparison with nginx
+
+| Feature | nginx | WolfProxy |
+|---------|-------|-----------|
+| Configuration | nginx native | nginx native (reads directly) |
+| Memory Usage | Low | Very Low |
+| Performance | Excellent | Excellent |
+| SSL/TLS | Yes | Yes (auto-detect from config) |
+| HTTP/2 | Yes | Yes |
+| Load Balancing | Yes | Yes |
+| Lua Scripting | Yes | No |
+| Module System | Yes | No (but extensible in Rust) |
+
+## License
+
+MIT License - See LICENSE file
+
+## Support
+
+- Website: http://wolf.uk.com
+- Issues: GitHub Issues

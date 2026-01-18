@@ -1,0 +1,12 @@
+[server]
+host = "0.0.0.0"
+http_port = 80
+https_port = 443
+
+[nginx]
+# Path to nginx configuration directory
+# WolfProxy will read from sites-enabled and conf.d
+config_dir = "/etc/nginx"
+
+# Automatically reload configuration when files change (future feature)
+auto_reload = false

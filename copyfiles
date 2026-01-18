@@ -1,0 +1,44 @@
+#!/bin/bash
+# Copy WolfProxy files to a remote server
+# (C) 2025 Wolf Software Systems Ltd
+
+set -e
+
+if [ "$#" -lt 1 ]; then
+    echo "Usage: $0 <user@host> [remote_path]"
+    echo "Example: $0 root@server.example.com /opt/wolfproxy"
+    exit 1
+fi
+
+REMOTE_HOST="$1"
+REMOTE_PATH="${2:-/opt/wolfproxy}"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Check if binary exists
+if [ ! -f "$SCRIPT_DIR/target/release/wolfproxy" ]; then
+    echo "Binary not found. Building..."
+    cd "$SCRIPT_DIR"
+    cargo build --release
+fi
+
+echo "Copying WolfProxy to $REMOTE_HOST:$REMOTE_PATH..."
+
+# Create remote directory
+ssh "$REMOTE_HOST" "mkdir -p $REMOTE_PATH"
+
+# Copy files
+scp "$SCRIPT_DIR/target/release/wolfproxy" "$REMOTE_HOST:$REMOTE_PATH/"
+scp "$SCRIPT_DIR/wolfproxy.toml.example" "$REMOTE_HOST:$REMOTE_PATH/"
+scp "$SCRIPT_DIR/install_service.sh" "$REMOTE_HOST:$REMOTE_PATH/"
+scp "$SCRIPT_DIR/README.md" "$REMOTE_HOST:$REMOTE_PATH/"
+
+# Copy config if it doesn't exist on remote
+ssh "$REMOTE_HOST" "[ -f $REMOTE_PATH/wolfproxy.toml ] || cp $REMOTE_PATH/wolfproxy.toml.example $REMOTE_PATH/wolfproxy.toml"
+
+echo ""
+echo "Files copied successfully!"
+echo ""
+echo "To install as service, SSH to the server and run:"
+echo "  cd $REMOTE_PATH"
+echo "  sudo ./install_service.sh"
