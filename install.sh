@@ -18,11 +18,20 @@ echo " (C) 2026 Wolf Software Systems Ltd - http://wolf.uk.com"
 echo " Installation Script"
 echo ""
 
-# Check for Rust
+# Source cargo environment if it exists
+if [ -f "$HOME/.cargo/env" ]; then
+    source "$HOME/.cargo/env"
+fi
+
+# Check for Rust - try common locations
 if ! command -v cargo &> /dev/null; then
-    echo "Error: Rust/Cargo is not installed."
-    echo "Please install Rust from https://rustup.rs/"
-    exit 1
+    if [ -x "$HOME/.cargo/bin/cargo" ]; then
+        export PATH="$HOME/.cargo/bin:$PATH"
+    else
+        echo "Error: Rust/Cargo is not installed."
+        echo "Please install Rust from https://rustup.rs/"
+        exit 1
+    fi
 fi
 
 echo "Step 1: Building WolfProxy (release mode)..."
