@@ -7,7 +7,7 @@
 
 use axum::{
     extract::{Request, State, ConnectInfo},
-    http::{StatusCode, HeaderMap, HeaderValue, header, Uri, Method},
+    http::{StatusCode, HeaderMap, HeaderValue, HeaderName, header, Uri, Method},
     response::{Response, IntoResponse},
     routing::any,
     Router,
@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::fs::File;
 use std::io::BufReader;
+use std::str::FromStr;
 
 use tokio::fs;
 use tokio::time::Duration;
@@ -902,29 +903,42 @@ async fn handle_proxy(
         proxy_req = proxy_req.header(name, value);
     }
     
-    // Add Host header for the backend
-    if let Some(host) = uri.host() {
-        let host_header = if let Some(port) = uri.port() {
-            format!("{}:{}", host, port)
-        } else {
-            host.to_string()
-        };
-        proxy_req = proxy_req.header(header::HOST, &host_header);
-    }
+    // Collect proxy_set_header directives - these override default headers
+    let mut custom_headers: HashMap<String, String> = HashMap::new();
     
-    // Apply proxy_set_header directives from location
+    // Apply proxy_set_header directives from location first
     for ph in &location.proxy_headers {
         let value = expand_proxy_header_value(&ph.value, &headers, client_addr);
-        if let Ok(hv) = HeaderValue::from_str(&value) {
-            proxy_req = proxy_req.header(&ph.name, hv);
+        custom_headers.insert(ph.name.to_lowercase(), value);
+    }
+    
+    // Apply server-level proxy headers (location overrides server)
+    for ph in server_headers {
+        let key = ph.name.to_lowercase();
+        if !custom_headers.contains_key(&key) {
+            let value = expand_proxy_header_value(&ph.value, &headers, client_addr);
+            custom_headers.insert(key, value);
         }
     }
     
-    // Apply server-level proxy headers
-    for ph in server_headers {
-        let value = expand_proxy_header_value(&ph.value, &headers, client_addr);
-        if let Ok(hv) = HeaderValue::from_str(&value) {
-            proxy_req = proxy_req.header(&ph.name, hv);
+    // If no custom Host header is set, default to backend host
+    if !custom_headers.contains_key("host") {
+        if let Some(host) = uri.host() {
+            let host_header = if let Some(port) = uri.port() {
+                format!("{}:{}", host, port)
+            } else {
+                host.to_string()
+            };
+            custom_headers.insert("host".to_string(), host_header);
+        }
+    }
+    
+    // Apply all custom headers
+    for (name, value) in &custom_headers {
+        if let Ok(hv) = HeaderValue::from_str(value) {
+            if let Ok(hn) = HeaderName::from_str(name) {
+                proxy_req = proxy_req.header(hn, hv);
+            }
         }
     }
     
