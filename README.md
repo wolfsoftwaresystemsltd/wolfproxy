@@ -197,9 +197,11 @@ WolfProxy includes a built-in monitoring dashboard accessible at `http://your-se
 - **Real-time stats**: Uptime, total requests, data in/out
 - **Upstream monitoring**: View all backend servers with their status (UP/DOWN)
 - **Health metrics**: Active connections, request counts, failure counts per server
+- **Traffic by upstream**: See request counts per upstream group
 - **Load balancing info**: Shows load balancing method per upstream group
 - **Auto-refresh**: Dashboard updates every 5 seconds
 - **JSON API**: Available at `/stats` for programmatic access
+- **Settings page**: Change username/password via web interface at `/settings`
 
 ### Configuration
 
@@ -210,6 +212,13 @@ port = 5001          # Port for the monitoring interface
 username = "admin"   # HTTP Basic Auth username
 password = "admin"   # HTTP Basic Auth password
 ```
+
+### Changing Credentials
+
+You can change the monitoring credentials in two ways:
+
+1. **Via Web Interface**: Navigate to `http://your-server:5001/settings` and use the form to update credentials
+2. **Via Config File**: Edit `wolfproxy.toml` and restart the service
 
 ### Security
 
