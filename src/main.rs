@@ -509,11 +509,13 @@ async fn handle_request(
         .unwrap_or_default();
     
     // Find matching virtual host
+    // Use port from Host header if present, otherwise default based on scheme
+    let default_port = if is_https { 443 } else { 80 };
     let port = headers.get("host")
         .and_then(|h| h.to_str().ok())
         .and_then(|h| h.split(':').nth(1))
         .and_then(|p| p.parse::<u16>().ok())
-        .unwrap_or(80);
+        .unwrap_or(default_port);
     
     let vhost = state.vhosts.get(&format!("{}:{}", host_name, port))
         .or_else(|| state.vhosts.get(&host_name))
