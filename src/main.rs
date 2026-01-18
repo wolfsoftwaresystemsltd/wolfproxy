@@ -517,14 +517,21 @@ async fn handle_request(
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(default_port);
     
+    info!("Looking up vhost: host={} port={} scheme={} is_https={}", host_name, port, scheme, is_https);
+    info!("Available vhosts: {:?}", state.vhosts.keys().collect::<Vec<_>>());
+    info!("Available default_vhosts: {:?}", state.default_vhosts.keys().collect::<Vec<_>>());
+    
     let vhost = state.vhosts.get(&format!("{}:{}", host_name, port))
         .or_else(|| state.vhosts.get(&host_name))
         .or_else(|| state.default_vhosts.get(&port));
     
     let vhost = match vhost {
-        Some(v) => v,
+        Some(v) => {
+            info!("Found vhost: {:?} with {} locations", v.server_names, v.locations.len());
+            v
+        },
         None => {
-            debug!("No vhost found for {} on port {}", host_name, port);
+            warn!("No vhost found for {} on port {}", host_name, port);
             return (StatusCode::NOT_FOUND, "No server configured for this host").into_response();
         }
     };
@@ -538,6 +545,7 @@ async fn handle_request(
 
     // Find matching location
     let location = find_matching_location(&vhost.locations, &uri_path);
+    info!("Location match for '{}': {:?}", uri_path, location.map(|l| &l.path));
     
     // Handle the request based on location configuration
     if let Some(loc) = location {
