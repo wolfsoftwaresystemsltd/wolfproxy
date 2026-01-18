@@ -352,6 +352,10 @@ auto_reload = false
     for (name, upstream) in &nginx_config.upstreams {
         info!("Loaded upstream: {} with {} servers ({:?})", 
               name, upstream.servers.len(), upstream.method);
+        for server in &upstream.servers {
+            info!("  - {}:{} (weight={}, backup={})", 
+                  server.address, server.port, server.weight, server.backup);
+        }
         upstreams.add_upstream(upstream);
     }
     
@@ -794,13 +798,48 @@ async fn handle_proxy(
     server_headers: &[ProxyHeader],
     client_addr: SocketAddr,
 ) -> Response {
+    info!("handle_proxy called with proxy_pass: {}", proxy_pass);
+    
     // Parse the proxy_pass URL
     let (backend_url, path_suffix) = if proxy_pass.starts_with("http://") || proxy_pass.starts_with("https://") {
-        // Direct URL
-        (proxy_pass.to_string(), req.uri().path_and_query().map(|pq| pq.to_string()).unwrap_or_default())
+        // Check if this is actually an upstream reference like http://upstream_name
+        let after_scheme = if proxy_pass.starts_with("https://") {
+            &proxy_pass[8..]
+        } else {
+            &proxy_pass[7..]
+        };
+        
+        // Extract potential upstream name (before any path or port that looks like IP)
+        let potential_upstream = after_scheme.split('/').next().unwrap_or(after_scheme);
+        let potential_upstream = potential_upstream.split(':').next().unwrap_or(potential_upstream);
+        
+        info!("Checking if '{}' is an upstream", potential_upstream);
+        
+        if let Some(lb) = state.upstreams.get(potential_upstream) {
+            // It's an upstream reference
+            info!("Found upstream '{}' with {} servers", potential_upstream, lb.servers.len());
+            let client_ip = headers.get("x-forwarded-for")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.split(',').next())
+                .map(|s| s.trim())
+                .unwrap_or(&client_addr.ip().to_string())
+                .to_string();
+            
+            if let Some(server) = lb.next_server(Some(&client_ip)) {
+                info!("Selected backend server: {}", server.url);
+                (server.url.clone(), req.uri().path_and_query().map(|pq| pq.to_string()).unwrap_or_default())
+            } else {
+                return (StatusCode::BAD_GATEWAY, "No healthy upstream servers").into_response();
+            }
+        } else {
+            // Direct URL
+            info!("Using direct URL: {}", proxy_pass);
+            (proxy_pass.to_string(), req.uri().path_and_query().map(|pq| pq.to_string()).unwrap_or_default())
+        }
     } else {
-        // Upstream reference
-        let upstream_name = proxy_pass.trim_start_matches("http://").trim_start_matches("https://");
+        // Upstream reference without scheme
+        let upstream_name = proxy_pass;
+        info!("Looking up upstream without scheme: {}", upstream_name);
         
         if let Some(lb) = state.upstreams.get(upstream_name) {
             let client_ip = headers.get("x-forwarded-for")
@@ -811,18 +850,21 @@ async fn handle_proxy(
                 .to_string();
             
             if let Some(server) = lb.next_server(Some(&client_ip)) {
+                info!("Selected backend server: {}", server.url);
                 (server.url.clone(), req.uri().path_and_query().map(|pq| pq.to_string()).unwrap_or_default())
             } else {
                 return (StatusCode::BAD_GATEWAY, "No healthy upstream servers").into_response();
             }
         } else {
             // Not an upstream, treat as direct URL
+            info!("Not found as upstream, treating as direct: http://{}", upstream_name);
             (format!("http://{}", upstream_name), req.uri().path_and_query().map(|pq| pq.to_string()).unwrap_or_default())
         }
     };
     
     // Build the proxy URL
     let proxy_url = format!("{}{}", backend_url.trim_end_matches('/'), path_suffix);
+    info!("Final proxy URL: {}", proxy_url);
     
     let uri: Uri = match proxy_url.parse() {
         Ok(u) => u,

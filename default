@@ -1,0 +1,291 @@
+# Define the load balancing pool with sticky sessions
+upstream backend_app_servers {
+    ip_hash;  
+    server 10.0.10.101 max_fails=3 fail_timeout=360s;
+    server 10.0.10.107 max_fails=3 fail_timeout=360s;
+    server 10.0.10.108 max_fails=3 fail_timeout=360s;
+}
+
+
+
+server {
+        server_name wolfserve.wolf.uk.com;
+
+
+
+    location / {
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # CRITICAL: Forward cookies for session persistence
+        proxy_set_header Cookie $http_cookie;
+        proxy_pass_header Set-Cookie;
+
+        # Changed to point to the upstream pool
+        proxy_pass http://backend_app_servers;
+    }
+
+
+
+
+    listen 443 ssl; # managed by Certbot
+    ssl_certificate /etc/letsencrypt/live/wolfserve.wolf.uk.com/fullchain.pem; # managed by Certbot
+    ssl_certificate_key /etc/letsencrypt/live/wolfserve.wolf.uk.com/privkey.pem; # managed by Certbot
+    include /etc/letsencrypt/options-ssl-nginx.conf; # managed by Certbot
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem; # managed by Certbot
+
+}
+
+server {
+        server_name wolf.uk.com;
+        server_name www.wolf.uk.com;
+    location / {
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Cookie $http_cookie;
+        proxy_pass_header Set-Cookie;
+
+        # Changed to point to the upstream pool
+        proxy_pass http://backend_app_servers;
+    }
+
+
+
+
+    listen 443 ssl; # managed by Certbot
+    ssl_certificate /etc/letsencrypt/live/wolf.uk.com/fullchain.pem; # managed by Certbot
+    ssl_certificate_key /etc/letsencrypt/live/wolf.uk.com/privkey.pem; # managed by Certbot
+    include /etc/letsencrypt/options-ssl-nginx.conf; # managed by Certbot
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem; # managed by Certbot
+
+}
+
+server {
+        server_name app.wolftracker.io;
+    location / {
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # CRITICAL: Forward cookies for session persistence
+        proxy_set_header Cookie $http_cookie;
+        proxy_pass_header Set-Cookie;
+
+        # Changed to point to the upstream pool
+        proxy_pass http://backend_app_servers;
+    }
+
+    listen 443 ssl; # managed by Certbot
+    ssl_certificate /etc/letsencrypt/live/app.wolftracker.io/fullchain.pem; # managed by Certbot
+    ssl_certificate_key /etc/letsencrypt/live/app.wolftracker.io/privkey.pem; # managed by Certbot
+    include /etc/letsencrypt/options-ssl-nginx.conf; # managed by Certbot
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem; # managed by Certbot
+
+}
+
+server {
+    server_name webrtc.intelligentwolf.com;
+  location / {
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Changed to point to the upstream pool
+        proxy_pass http://10.0.10.109:8765;
+# 1. Force HTTP/1.1 for the proxy connection
+        proxy_http_version 1.1;
+# 2. These two headers are ESSENTIAL for WebSockets
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+
+        # 3. (Optional but recommended) Other standard proxy headers
+    }
+
+    listen 443 ssl; # managed by Certbot
+    ssl_certificate /etc/letsencrypt/live/webrtc.intelligentwolf.com/fullchain.pem; # managed by Certbot
+    ssl_certificate_key /etc/letsencrypt/live/webrtc.intelligentwolf.com/privkey.pem; # managed by Certbot
+    include /etc/letsencrypt/options-ssl-nginx.conf; # managed by Certbot
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem; # managed by Certbot
+
+}    
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name app.wolf.uk.com;
+
+
+    # Load the certificate for wolf.uk.com
+    ssl_certificate /etc/letsencrypt/live/app.wolf.uk.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/app.wolf.uk.com/privkey.pem;
+    
+    # Standard Certbot settings
+    include /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+
+    location / {
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        
+        # CRITICAL: Forward cookies for session persistence
+        proxy_set_header Cookie $http_cookie;
+        proxy_pass_header Set-Cookie;
+        
+        # Changed to point to the upstream pool
+        proxy_pass http://backend_app_servers;
+    }
+}
+
+server {
+    server_name property.intelligentwolf.com;
+
+
+    location / {
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        
+        # CRITICAL: Forward cookies for session persistence
+        proxy_set_header Cookie $http_cookie;
+        proxy_pass_header Set-Cookie;
+        
+        # Changed to point to the upstream pool
+        proxy_pass http://backend_app_servers;
+    }
+
+    listen 443 ssl; # managed by Certbot
+    ssl_certificate /etc/letsencrypt/live/property.intelligentwolf.com/fullchain.pem; # managed by Certbot
+    ssl_certificate_key /etc/letsencrypt/live/property.intelligentwolf.com/privkey.pem; # managed by Certbot
+    include /etc/letsencrypt/options-ssl-nginx.conf; # managed by Certbot
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem; # managed by Certbot
+
+}
+
+# Server block for app.intelligentwolf.com (SSL/443)
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name app.intelligentwolf.com;
+
+    # Load the certificate for intelligentwolf.com
+    ssl_certificate /etc/letsencrypt/live/app.intelligentwolf.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/app.intelligentwolf.com/privkey.pem;
+
+    # Standard Certbot settings
+    include /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+
+    location / {
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        
+        # CRITICAL: Forward cookies for session persistence
+        proxy_set_header Cookie $http_cookie;
+        proxy_pass_header Set-Cookie;
+        
+        # Changed to point to the upstream pool
+        proxy_pass http://backend_app_servers;
+    }
+}
+
+# --- HTTP to HTTPS Redirects (No changes needed) ---
+
+# Redirect HTTP to HTTPS for app.wolf.uk.com
+server {
+    listen 80;
+    listen [::]:80;
+    server_name app.wolf.uk.com;
+    return 301 https://$host$request_uri;
+}
+
+# Redirect HTTP to HTTPS for app.intelligentwolf.com
+server {
+    listen 80;
+    listen [::]:80;
+    server_name app.intelligentwolf.com;
+    return 301 https://$host$request_uri;
+}
+
+
+
+server {
+    if ($host = property.intelligentwolf.com) {
+        return 301 https://$host$request_uri;
+    } # managed by Certbot
+
+
+    listen 80;
+    server_name property.intelligentwolf.com;
+    return 404; # managed by Certbot
+
+
+}
+
+
+server {
+    if ($host = webrtc.intelligentwolf.com) {
+        return 301 https://$host$request_uri;
+    } # managed by Certbot
+
+
+    listen 80;
+    server_name webrtc.intelligentwolf.com;
+    return 404; # managed by Certbot
+
+
+}
+
+
+
+server {
+    if ($host = app.wolftracker.io) {
+        return 301 https://$host$request_uri;
+    } # managed by Certbot
+
+
+        server_name app.wolftracker.io;
+    listen 80;
+    return 404; # managed by Certbot
+
+
+}
+
+
+
+server {
+    if ($host = wolfserve.wolf.uk.com) {
+        return 301 https://$host$request_uri;
+    } # managed by Certbot
+
+
+        server_name wolfserve.wolf.uk.com;
+    listen 80;
+    return 404; # managed by Certbot
+
+
+}
+
+
+server {
+    if ($host = wolf.uk.com) {
+        return 301 https://$host$request_uri;
+    } # managed by Certbot
+
+
+        server_name wolf.uk.com;
+    listen 80;
+    return 404; # managed by Certbot
+
+
+}
