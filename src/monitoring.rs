@@ -7,10 +7,12 @@ use axum::{
     response::{Html, IntoResponse, Response},
     routing::get,
     Router,
+    Form,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::RwLock;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -101,7 +103,8 @@ impl Default for MonitoringConfig {
 pub struct MonitoringState {
     pub upstreams: Arc<UpstreamManager>,
     pub stats: Arc<TrafficStats>,
-    pub config: MonitoringConfig,
+    pub config: RwLock<MonitoringConfig>,
+    pub config_path: String,
     pub vhost_count: usize,
     pub server_blocks: usize,
 }
@@ -178,9 +181,11 @@ async fn monitoring_page(
     headers: HeaderMap,
 ) -> Response {
     // Check authentication
-    if !check_auth(&headers, &state.config.username, &state.config.password) {
+    let config = state.config.read().await;
+    if !check_auth(&headers, &config.username, &config.password) {
         return require_auth();
     }
+    drop(config);
 
     let stats = &state.stats;
     let uptime = format_duration(stats.uptime());
@@ -454,6 +459,7 @@ async fn monitoring_page(
         </table>
 
         <div class="footer">
+            <a href="/settings" style="color: #00d4ff; margin-right: 20px;">⚙️ Settings</a>
             (C)2025 Wolf Software Systems Ltd - <a href="http://wolf.uk.com" style="color: #00d4ff;">wolf.uk.com</a>
             <br>
             Auto-refresh: 5 seconds
@@ -480,9 +486,11 @@ async fn stats_json(
     headers: HeaderMap,
 ) -> Response {
     // Check authentication
-    if !check_auth(&headers, &state.config.username, &state.config.password) {
+    let config = state.config.read().await;
+    if !check_auth(&headers, &config.username, &config.password) {
         return require_auth();
     }
+    drop(config);
 
     let stats = &state.stats;
     
@@ -529,11 +537,367 @@ async fn stats_json(
         .unwrap()
 }
 
+/// Form data for password change
+#[derive(serde::Deserialize)]
+struct PasswordChangeForm {
+    current_password: String,
+    new_username: String,
+    new_password: String,
+    confirm_password: String,
+}
+
+/// Settings page handler
+async fn settings_page(
+    State(state): State<Arc<MonitoringState>>,
+    headers: HeaderMap,
+) -> Response {
+    // Check authentication
+    let config = state.config.read().await;
+    if !check_auth(&headers, &config.username, &config.password) {
+        return require_auth();
+    }
+    let current_username = config.username.clone();
+    drop(config);
+
+    let html = format!(r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WolfProxy Settings</title>
+    <style>
+        * {{
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }}
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            color: #e0e0e0;
+            min-height: 100vh;
+            padding: 20px;
+        }}
+        .container {{
+            max-width: 600px;
+            margin: 0 auto;
+        }}
+        h1 {{
+            text-align: center;
+            color: #00d4ff;
+            margin-bottom: 30px;
+            font-size: 2em;
+        }}
+        .nav {{
+            text-align: center;
+            margin-bottom: 30px;
+        }}
+        .nav a {{
+            color: #00d4ff;
+            text-decoration: none;
+            margin: 0 15px;
+        }}
+        .nav a:hover {{
+            text-decoration: underline;
+        }}
+        .form-card {{
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 15px;
+            padding: 30px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }}
+        .form-group {{
+            margin-bottom: 20px;
+        }}
+        label {{
+            display: block;
+            margin-bottom: 8px;
+            color: #00d4ff;
+            font-weight: 500;
+        }}
+        input[type="text"],
+        input[type="password"] {{
+            width: 100%;
+            padding: 12px;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 8px;
+            background: rgba(0, 0, 0, 0.3);
+            color: #fff;
+            font-size: 16px;
+        }}
+        input[type="text"]:focus,
+        input[type="password"]:focus {{
+            outline: none;
+            border-color: #00d4ff;
+        }}
+        button {{
+            width: 100%;
+            padding: 15px;
+            background: linear-gradient(135deg, #00d4ff 0%, #0099cc 100%);
+            border: none;
+            border-radius: 8px;
+            color: #fff;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }}
+        button:hover {{
+            transform: translateY(-2px);
+            box-shadow: 0 5px 20px rgba(0, 212, 255, 0.4);
+        }}
+        .message {{
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            text-align: center;
+        }}
+        .success {{
+            background: rgba(81, 207, 102, 0.2);
+            border: 1px solid #51cf66;
+            color: #51cf66;
+        }}
+        .error {{
+            background: rgba(255, 107, 107, 0.2);
+            border: 1px solid #ff6b6b;
+            color: #ff6b6b;
+        }}
+        .footer {{
+            text-align: center;
+            margin-top: 30px;
+            color: #666;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>⚙️ Settings</h1>
+        
+        <div class="nav">
+            <a href="/">← Back to Dashboard</a>
+        </div>
+        
+        <div class="form-card">
+            <h2 style="color: #00d4ff; margin-bottom: 20px;">Change Credentials</h2>
+            
+            <form method="POST" action="/settings">
+                <div class="form-group">
+                    <label for="current_password">Current Password</label>
+                    <input type="password" id="current_password" name="current_password" required>
+                </div>
+                
+                <div class="form-group">
+                    <label for="new_username">New Username</label>
+                    <input type="text" id="new_username" name="new_username" value="{}" required>
+                </div>
+                
+                <div class="form-group">
+                    <label for="new_password">New Password</label>
+                    <input type="password" id="new_password" name="new_password" required>
+                </div>
+                
+                <div class="form-group">
+                    <label for="confirm_password">Confirm New Password</label>
+                    <input type="password" id="confirm_password" name="confirm_password" required>
+                </div>
+                
+                <button type="submit">Update Credentials</button>
+            </form>
+        </div>
+        
+        <div class="footer">
+            (C)2025 Wolf Software Systems Ltd
+        </div>
+    </div>
+</body>
+</html>"#, current_username);
+
+    Html(html).into_response()
+}
+
+/// Handle password change form submission
+async fn change_password(
+    State(state): State<Arc<MonitoringState>>,
+    headers: HeaderMap,
+    Form(form): Form<PasswordChangeForm>,
+) -> Response {
+    // Check authentication
+    let config = state.config.read().await;
+    if !check_auth(&headers, &config.username, &config.password) {
+        return require_auth();
+    }
+    
+    // Verify current password
+    if form.current_password != config.password {
+        drop(config);
+        return error_page("Current password is incorrect").into_response();
+    }
+    drop(config);
+    
+    // Validate new password
+    if form.new_password != form.confirm_password {
+        return error_page("New passwords do not match").into_response();
+    }
+    
+    if form.new_password.is_empty() {
+        return error_page("New password cannot be empty").into_response();
+    }
+    
+    if form.new_username.is_empty() {
+        return error_page("Username cannot be empty").into_response();
+    }
+    
+    // Update the config
+    {
+        let mut config = state.config.write().await;
+        config.username = form.new_username.clone();
+        config.password = form.new_password.clone();
+    }
+    
+    // Save to config file
+    if let Err(e) = save_monitoring_config(&state.config_path, &form.new_username, &form.new_password).await {
+        tracing::error!("Failed to save config: {}", e);
+        return error_page(&format!("Failed to save config: {}", e)).into_response();
+    }
+    
+    tracing::info!("Monitoring credentials updated for user: {}", form.new_username);
+    
+    // Return success page with re-auth prompt
+    let html = r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Credentials Updated</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            color: #e0e0e0;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .card {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 15px;
+            padding: 40px;
+            text-align: center;
+            border: 1px solid rgba(81, 207, 102, 0.3);
+        }
+        h1 { color: #51cf66; margin-bottom: 20px; }
+        p { margin-bottom: 20px; }
+        a {
+            display: inline-block;
+            padding: 12px 30px;
+            background: linear-gradient(135deg, #00d4ff 0%, #0099cc 100%);
+            color: #fff;
+            text-decoration: none;
+            border-radius: 8px;
+            font-weight: 600;
+        }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>✅ Credentials Updated</h1>
+        <p>Your username and password have been changed successfully.</p>
+        <p>You will need to log in again with your new credentials.</p>
+        <a href="/">Go to Dashboard</a>
+    </div>
+</body>
+</html>"#;
+    
+    // Clear auth to force re-login
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::WWW_AUTHENTICATE, "Basic realm=\"WolfProxy Monitoring\"")
+        .header(header::CONTENT_TYPE, "text/html")
+        .body(axum::body::Body::from(html))
+        .unwrap()
+}
+
+/// Generate an error page
+fn error_page(message: &str) -> Html<String> {
+    Html(format!(r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Error</title>
+    <style>
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            color: #e0e0e0;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }}
+        .card {{
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 15px;
+            padding: 40px;
+            text-align: center;
+            border: 1px solid rgba(255, 107, 107, 0.3);
+        }}
+        h1 {{ color: #ff6b6b; margin-bottom: 20px; }}
+        p {{ margin-bottom: 20px; }}
+        a {{
+            display: inline-block;
+            padding: 12px 30px;
+            background: linear-gradient(135deg, #00d4ff 0%, #0099cc 100%);
+            color: #fff;
+            text-decoration: none;
+            border-radius: 8px;
+            font-weight: 600;
+        }}
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>❌ Error</h1>
+        <p>{}</p>
+        <a href="/settings">Go Back</a>
+    </div>
+</body>
+</html>"#, message))
+}
+
+/// Save monitoring credentials to config file
+async fn save_monitoring_config(config_path: &str, username: &str, password: &str) -> Result<(), String> {
+    // Read the existing config file
+    let content = tokio::fs::read_to_string(config_path).await
+        .map_err(|e| format!("Failed to read config file: {}", e))?;
+    
+    // Parse and update the TOML
+    let mut doc = content.parse::<toml_edit::DocumentMut>()
+        .map_err(|e| format!("Failed to parse config file: {}", e))?;
+    
+    // Ensure monitoring section exists
+    if doc.get("monitoring").is_none() {
+        doc["monitoring"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    
+    // Update credentials
+    doc["monitoring"]["username"] = toml_edit::value(username);
+    doc["monitoring"]["password"] = toml_edit::value(password);
+    
+    // Write back to file
+    tokio::fs::write(config_path, doc.to_string()).await
+        .map_err(|e| format!("Failed to write config file: {}", e))?;
+    
+    Ok(())
+}
+
 /// Create the monitoring router
 pub fn create_monitoring_router(state: Arc<MonitoringState>) -> Router {
     Router::new()
         .route("/", get(monitoring_page))
         .route("/stats", get(stats_json))
+        .route("/settings", get(settings_page).post(change_password))
         .with_state(state)
 }
 
@@ -541,6 +905,7 @@ pub fn create_monitoring_router(state: Arc<MonitoringState>) -> Router {
 pub async fn start_monitoring_server(
     host: &str,
     config: MonitoringConfig,
+    config_path: String,
     upstreams: Arc<UpstreamManager>,
     stats: Arc<TrafficStats>,
     vhost_count: usize,
@@ -555,7 +920,8 @@ pub async fn start_monitoring_server(
     let state = Arc::new(MonitoringState {
         upstreams,
         stats,
-        config,
+        config: RwLock::new(config),
+        config_path,
         vhost_count,
         server_blocks,
     });

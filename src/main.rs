@@ -414,10 +414,12 @@ password = "admin"
     let monitoring_host = host_ip.clone();
     let monitoring_upstreams = upstreams_arc.clone();
     let monitoring_stats = traffic_stats.clone();
+    let config_path = "wolfproxy.toml".to_string();
     tasks.push(tokio::spawn(async move {
         monitoring::start_monitoring_server(
             &monitoring_host,
             monitoring_config,
+            config_path,
             monitoring_upstreams,
             monitoring_stats,
             vhost_count,
