@@ -38,6 +38,7 @@ use futures_util::future::join_all;
 use serde::Deserialize;
 use tracing::{info, warn, error, debug};
 use regex::Regex;
+use tower_http::compression::CompressionLayer;
 
 mod nginx;
 mod upstream;
@@ -379,6 +380,7 @@ auto_reload = false
     
     let app = Router::new()
         .fallback(any(handle_request))
+        .layer(CompressionLayer::new())
         .with_state(state.clone());
 
     let mut tasks = Vec::new();

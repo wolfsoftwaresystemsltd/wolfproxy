@@ -19,7 +19,7 @@ anyhow = "1"
 
 # Tower middleware
 tower = { version = "0.4", features = ["util", "timeout", "retry", "load-shed", "limit"] }
-tower-http = { version = "0.4", features = ["fs", "trace", "cors", "compression-gzip"] }
+tower-http = { version = "0.5", features = ["fs", "trace", "cors", "compression-gzip", "decompression-gzip"] }
 
 # HTTP client for proxying
 hyper = { version = "1", features = ["full"] }
