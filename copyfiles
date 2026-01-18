@@ -3,7 +3,7 @@
 # (C) 2026 Wolf Software Systems Ltd
 
 # Files needed to build and run wolfproxy
-FILES="src Cargo.toml install_service.sh wolfproxy.toml wolfproxy.toml.example build.sh run.sh LICENSE README.md"
+FILES="src Cargo.toml install_service.sh install.sh wolfproxy.toml wolfproxy.toml.example build.sh run.sh LICENSE README.md"
 
 # Target servers
 SERVERS=(
@@ -16,13 +16,13 @@ echo "WolfProxy Remote Deployment"
 echo "==========================="
 echo ""
 
-# Cleanup remote targets to avoid GLIBC conflicts
-echo "Cleanup remote target directories to avoid GLIBC conflicts..."
+# Create remote directories and cleanup targets
+echo "Preparing remote directories..."
 for target in "${SERVERS[@]}"; do
     server="${target%:*}"
     path="${target#*:}"
-    echo "  Cleaning $server:$path/target..."
-    ssh "$server" "rm -rf $path/target" 2>/dev/null || true
+    echo "  Creating $server:$path and cleaning target..."
+    ssh "$server" "mkdir -p $path && rm -rf $path/target" 2>/dev/null || true
 done
 echo ""
 
@@ -31,7 +31,6 @@ for target in "${SERVERS[@]}"; do
     server="${target%:*}"
     path="${target#*:}"
     echo "Syncing to $server:$path..."
-    ssh "$server" "mkdir -p $path" 2>/dev/null || true
     scp -r $FILES "$target/"
 done
 
@@ -41,5 +40,8 @@ echo ""
 echo "To install on remote server:"
 echo "  1. SSH to the server"
 echo "  2. cd to wolfproxy directory"
-echo "  3. Run: cargo build --release"
-echo "  4. Run: sudo ./install_service.sh"
+echo "  3. Run: ./install.sh"
+echo ""
+echo "Or manually:"
+echo "  cargo build --release"
+echo "  sudo ./install_service.sh"
