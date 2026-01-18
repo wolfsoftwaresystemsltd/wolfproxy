@@ -354,16 +354,18 @@ auto_reload = false
         info!("Loaded upstream: {} with {} servers ({:?})", 
               name, upstream.servers.len(), upstream.method);
         for server in &upstream.servers {
-            info!("  - {}:{} (weight={}, backup={})", 
+            debug!("  - {}:{} (weight={}, backup={})", 
                   server.address, server.port, server.weight, server.backup);
         }
         upstreams.add_upstream(upstream);
     }
     
-    // Create HTTP client for proxying
+    // Create HTTP client for proxying with optimized settings
     let http_client = HyperClient::builder(TokioExecutor::new())
-        .pool_idle_timeout(Duration::from_secs(30))
-        .pool_max_idle_per_host(32)
+        .pool_idle_timeout(Duration::from_secs(90))      // Keep connections alive longer
+        .pool_max_idle_per_host(100)                      // More idle connections per backend
+        .retry_canceled_requests(true)                    // Retry if connection was closed
+        .set_host(false)                                  // We set Host header ourselves
         .build_http();
 
     let state = Arc::new(AppState {
@@ -522,9 +524,9 @@ async fn handle_request(
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(default_port);
     
-    info!("Looking up vhost: host={} port={} scheme={} is_https={}", host_name, port, scheme, is_https);
-    info!("Available vhosts: {:?}", state.vhosts.keys().collect::<Vec<_>>());
-    info!("Available default_vhosts: {:?}", state.default_vhosts.keys().collect::<Vec<_>>());
+    debug!("Looking up vhost: host={} port={} scheme={} is_https={}", host_name, port, scheme, is_https);
+    debug!("Available vhosts: {:?}", state.vhosts.keys().collect::<Vec<_>>());
+    debug!("Available default_vhosts: {:?}", state.default_vhosts.keys().collect::<Vec<_>>());
     
     let vhost = state.vhosts.get(&format!("{}:{}", host_name, port))
         .or_else(|| state.vhosts.get(&host_name))
@@ -532,7 +534,7 @@ async fn handle_request(
     
     let vhost = match vhost {
         Some(v) => {
-            info!("Found vhost: {:?} with {} locations", v.server_names, v.locations.len());
+            debug!("Found vhost: {:?} with {} locations", v.server_names, v.locations.len());
             v
         },
         None => {
@@ -550,7 +552,7 @@ async fn handle_request(
 
     // Find matching location
     let location = find_matching_location(&vhost.locations, &uri_path);
-    info!("Location match for '{}': {:?}", uri_path, location.map(|l| &l.path));
+    debug!("Location match for '{}': {:?}", uri_path, location.map(|l| &l.path));
     
     // Handle the request based on location configuration
     if let Some(loc) = location {
@@ -799,7 +801,7 @@ async fn handle_proxy(
     server_headers: &[ProxyHeader],
     client_addr: SocketAddr,
 ) -> Response {
-    info!("handle_proxy called with proxy_pass: {}", proxy_pass);
+    debug!("handle_proxy called with proxy_pass: {}", proxy_pass);
     
     // Parse the proxy_pass URL
     let (backend_url, path_suffix) = if proxy_pass.starts_with("http://") || proxy_pass.starts_with("https://") {
@@ -814,11 +816,11 @@ async fn handle_proxy(
         let potential_upstream = after_scheme.split('/').next().unwrap_or(after_scheme);
         let potential_upstream = potential_upstream.split(':').next().unwrap_or(potential_upstream);
         
-        info!("Checking if '{}' is an upstream", potential_upstream);
+        debug!("Checking if '{}' is an upstream", potential_upstream);
         
         if let Some(lb) = state.upstreams.get(potential_upstream) {
             // It's an upstream reference
-            info!("Found upstream '{}' with {} servers", potential_upstream, lb.servers.len());
+            debug!("Found upstream '{}' with {} servers", potential_upstream, lb.servers.len());
             let client_ip = headers.get("x-forwarded-for")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.split(',').next())
@@ -827,20 +829,20 @@ async fn handle_proxy(
                 .to_string();
             
             if let Some(server) = lb.next_server(Some(&client_ip)) {
-                info!("Selected backend server: {}", server.url);
+                debug!("Selected backend server: {}", server.url);
                 (server.url.clone(), req.uri().path_and_query().map(|pq| pq.to_string()).unwrap_or_default())
             } else {
                 return (StatusCode::BAD_GATEWAY, "No healthy upstream servers").into_response();
             }
         } else {
             // Direct URL
-            info!("Using direct URL: {}", proxy_pass);
+            debug!("Using direct URL: {}", proxy_pass);
             (proxy_pass.to_string(), req.uri().path_and_query().map(|pq| pq.to_string()).unwrap_or_default())
         }
     } else {
         // Upstream reference without scheme
         let upstream_name = proxy_pass;
-        info!("Looking up upstream without scheme: {}", upstream_name);
+        debug!("Looking up upstream without scheme: {}", upstream_name);
         
         if let Some(lb) = state.upstreams.get(upstream_name) {
             let client_ip = headers.get("x-forwarded-for")
@@ -851,21 +853,21 @@ async fn handle_proxy(
                 .to_string();
             
             if let Some(server) = lb.next_server(Some(&client_ip)) {
-                info!("Selected backend server: {}", server.url);
+                debug!("Selected backend server: {}", server.url);
                 (server.url.clone(), req.uri().path_and_query().map(|pq| pq.to_string()).unwrap_or_default())
             } else {
                 return (StatusCode::BAD_GATEWAY, "No healthy upstream servers").into_response();
             }
         } else {
             // Not an upstream, treat as direct URL
-            info!("Not found as upstream, treating as direct: http://{}", upstream_name);
+            debug!("Not found as upstream, treating as direct: http://{}", upstream_name);
             (format!("http://{}", upstream_name), req.uri().path_and_query().map(|pq| pq.to_string()).unwrap_or_default())
         }
     };
     
     // Build the proxy URL
     let proxy_url = format!("{}{}", backend_url.trim_end_matches('/'), path_suffix);
-    info!("Final proxy URL: {}", proxy_url);
+    debug!("Final proxy URL: {}", proxy_url);
     
     let uri: Uri = match proxy_url.parse() {
         Ok(u) => u,
@@ -966,17 +968,9 @@ async fn handle_proxy(
         }
     };
     
-    // Build response
+    // Build response - stream the body instead of buffering
     let status = response.status();
     let resp_headers = response.headers().clone();
-    
-    let body_bytes = match response.into_body().collect().await {
-        Ok(b) => b.to_bytes(),
-        Err(e) => {
-            error!("Failed to read upstream response: {}", e);
-            return (StatusCode::BAD_GATEWAY, "Failed to read upstream response").into_response();
-        }
-    };
     
     let mut resp = Response::builder().status(status);
     
@@ -998,7 +992,10 @@ async fn handle_proxy(
         }
     }
     
-    resp.body(Body::from(body_bytes)).unwrap_or_else(|_| {
+    // Stream the response body directly without buffering
+    let body = Body::new(response.into_body());
+    
+    resp.body(body).unwrap_or_else(|_| {
         (StatusCode::INTERNAL_SERVER_ERROR, "Failed to build response").into_response()
     })
 }
