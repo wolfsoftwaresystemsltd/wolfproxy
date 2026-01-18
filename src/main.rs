@@ -46,6 +46,10 @@ use upstream::UpstreamManager;
 
 use hyper_util::rt::TokioIo;
 
+/// Marker for HTTPS connections
+#[derive(Clone, Copy, Debug)]
+pub struct IsHttps(pub bool);
+
 /// Tower to Hyper service adapter
 #[derive(Clone)]
 pub struct TowerToHyperService<S> {
@@ -436,12 +440,13 @@ auto_reload = false
                         match acceptor.accept(stream).await {
                             Ok(tls_stream) => {
                                 let io = TokioIo::new(tls_stream);
-                                // Create a service that injects ConnectInfo
+                                // Create a service that injects ConnectInfo and IsHttps marker
                                 let service = hyper::service::service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
                                     let mut app = app.clone();
                                     async move {
-                                        // Insert ConnectInfo extension
+                                        // Insert ConnectInfo and IsHttps extensions
                                         req.extensions_mut().insert(ConnectInfo(remote_addr));
+                                        req.extensions_mut().insert(IsHttps(true));
                                         let req = Request::from(req);
                                         let resp = app.call(req).await.unwrap_or_else(|_| {
                                             (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response()
@@ -486,7 +491,11 @@ async fn handle_request(
     let uri_path = uri.path().to_string();
     let _query_string = uri.query().unwrap_or("").to_string();
     
-    debug!("Request: {} {} from {}", method, uri_path, addr);
+    // Check if this is an HTTPS connection (marker set by HTTPS handler)
+    let is_https = req.extensions().get::<IsHttps>().map(|h| h.0).unwrap_or(false);
+    let scheme = if is_https { "https" } else { "http" };
+    
+    debug!("Request: {} {} {} from {}", scheme, method, uri_path, addr);
     
     // Safety: prevent path traversal
     if uri_path.contains("..") {
@@ -520,7 +529,7 @@ async fn handle_request(
 
     // Check if conditions at server level
     for condition in &vhost.if_conditions {
-        if let Some(response) = evaluate_if_condition(condition, &host_name, &uri_path, &method) {
+        if let Some(response) = evaluate_if_condition(condition, &host_name, &uri_path, &method, scheme) {
             return response;
         }
     }
@@ -532,7 +541,7 @@ async fn handle_request(
     if let Some(loc) = location {
         // Check for return directive
         if let Some(code) = loc.return_code {
-            return handle_return(code, loc.return_value.as_deref(), &host_name, &uri_path);
+            return handle_return(code, loc.return_value.as_deref(), &host_name, &uri_path, scheme);
         }
         
         // Check deny/allow
@@ -633,7 +642,7 @@ fn find_matching_location<'a>(locations: &'a [LocationBlock], path: &str) -> Opt
 }
 
 /// Evaluate an if condition
-fn evaluate_if_condition(condition: &IfCondition, host: &str, path: &str, method: &Method) -> Option<Response> {
+fn evaluate_if_condition(condition: &IfCondition, host: &str, path: &str, method: &Method, scheme: &str) -> Option<Response> {
     let cond = &condition.condition;
     
     // Common conditions
@@ -652,6 +661,21 @@ fn evaluate_if_condition(condition: &IfCondition, host: &str, path: &str, method
         } else {
             false
         }
+    } else if cond.contains("$scheme") {
+        // if ($scheme = http) or if ($scheme != https)
+        if cond.contains("!=") {
+            if let Some(expected) = cond.split("!=").nth(1) {
+                let expected = expected.trim().trim_end_matches(')').trim();
+                scheme != expected
+            } else {
+                false
+            }
+        } else if let Some(expected) = cond.split('=').nth(1) {
+            let expected = expected.trim().trim_end_matches(')').trim();
+            scheme == expected
+        } else {
+            false
+        }
     } else {
         // Unsupported condition
         false
@@ -659,7 +683,7 @@ fn evaluate_if_condition(condition: &IfCondition, host: &str, path: &str, method
     
     if matched {
         if let Some(code) = condition.return_code {
-            return Some(handle_return(code, condition.return_value.as_deref(), host, path));
+            return Some(handle_return(code, condition.return_value.as_deref(), host, path, scheme));
         }
     }
     
@@ -667,17 +691,23 @@ fn evaluate_if_condition(condition: &IfCondition, host: &str, path: &str, method
 }
 
 /// Handle a return directive
-fn handle_return(code: u16, value: Option<&str>, host: &str, path: &str) -> Response {
+fn handle_return(code: u16, value: Option<&str>, host: &str, path: &str, scheme: &str) -> Response {
     let status = StatusCode::from_u16(code).unwrap_or(StatusCode::OK);
     
     if (300..400).contains(&code) {
         // Redirect
         if let Some(url) = value {
-            // Expand variables
+            // Expand variables - use actual scheme to prevent redirect loops
             let url = url
                 .replace("$host", host)
                 .replace("$request_uri", path)
-                .replace("$scheme", "https"); // Default to https for redirects
+                .replace("$scheme", scheme);
+            
+            // If we're already on HTTPS and the redirect is to the same URL, don't redirect
+            if scheme == "https" && url == format!("https://{}{}", host, path) {
+                // Already on HTTPS at the target URL, don't redirect
+                return (StatusCode::OK, "").into_response();
+            }
             
             Response::builder()
                 .status(status)
