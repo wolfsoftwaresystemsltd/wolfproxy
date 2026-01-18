@@ -857,6 +857,9 @@ async fn handle_proxy(
 ) -> Response {
     debug!("handle_proxy called with proxy_pass: {}", proxy_pass);
     
+    // Track which upstream was used (if any)
+    let mut upstream_name_used: Option<String> = None;
+    
     // Parse the proxy_pass URL
     let (backend_url, path_suffix) = if proxy_pass.starts_with("http://") || proxy_pass.starts_with("https://") {
         // Check if this is actually an upstream reference like http://upstream_name
@@ -875,6 +878,7 @@ async fn handle_proxy(
         if let Some(lb) = state.upstreams.get(potential_upstream) {
             // It's an upstream reference
             debug!("Found upstream '{}' with {} servers", potential_upstream, lb.servers.len());
+            upstream_name_used = Some(potential_upstream.to_string());
             let client_ip = headers.get("x-forwarded-for")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.split(',').next())
@@ -899,6 +903,7 @@ async fn handle_proxy(
         debug!("Looking up upstream without scheme: {}", upstream_name);
         
         if let Some(lb) = state.upstreams.get(upstream_name) {
+            upstream_name_used = Some(upstream_name.to_string());
             let client_ip = headers.get("x-forwarded-for")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.split(',').next())
@@ -918,6 +923,11 @@ async fn handle_proxy(
             (format!("http://{}", upstream_name), req.uri().path_and_query().map(|pq| pq.to_string()).unwrap_or_default())
         }
     };
+    
+    // Record upstream request for monitoring
+    if let Some(ref name) = upstream_name_used {
+        state.traffic_stats.record_upstream_request(name);
+    }
     
     // Build the proxy URL
     let proxy_url = format!("{}{}", backend_url.trim_end_matches('/'), path_suffix);

@@ -56,7 +56,6 @@ impl TrafficStats {
         self.bytes_out.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    #[allow(dead_code)]
     pub fn record_upstream_request(&self, upstream_name: &str) {
         self.upstream_requests
             .entry(upstream_name.to_string())
