@@ -282,6 +282,7 @@ impl LoadBalancer {
 }
 
 /// Manager for all upstreams
+#[derive(Clone)]
 pub struct UpstreamManager {
     upstreams: HashMap<String, Arc<LoadBalancer>>,
 }

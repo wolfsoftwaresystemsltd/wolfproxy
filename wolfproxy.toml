@@ -10,3 +10,12 @@ config_dir = "/etc/nginx"
 
 # Automatically reload configuration when files change
 auto_reload = false
+
+[monitoring]
+# Enable the monitoring web interface
+enabled = true
+# Port for the monitoring server
+port = 5001
+# HTTP Basic Auth credentials
+username = "admin"
+password = "admin"

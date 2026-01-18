@@ -42,9 +42,11 @@ use tower_http::compression::CompressionLayer;
 
 mod nginx;
 mod upstream;
+mod monitoring;
 
 use nginx::{NginxConfig, ServerBlock, LocationBlock, ProxyHeader, RewriteFlag, IfCondition};
 use upstream::UpstreamManager;
+use monitoring::{MonitoringConfig, TrafficStats};
 
 use hyper_util::rt::TokioIo;
 
@@ -130,6 +132,8 @@ fn load_ssl_keys(cert_path: &Path, key_path: &Path) -> anyhow::Result<CertifiedK
 struct Config {
     server: ServerConfig,
     nginx: NginxConfigSettings,
+    #[serde(default)]
+    monitoring: MonitoringConfig,
 }
 
 #[allow(dead_code)]
@@ -226,7 +230,9 @@ struct AppState {
     vhosts: HashMap<String, VirtualHost>,
     default_vhosts: HashMap<u16, VirtualHost>,
     upstreams: UpstreamManager,
+    upstreams_arc: Arc<UpstreamManager>,
     http_client: HyperClient<hyper_util::client::legacy::connect::HttpConnector, Full<Bytes>>,
+    traffic_stats: Arc<TrafficStats>,
 }
 
 /// Check if error is a common connection error (for logging purposes)
@@ -270,6 +276,12 @@ https_port = 443
 [nginx]
 config_dir = "/etc/nginx"
 auto_reload = false
+
+[monitoring]
+enabled = true
+port = 5001
+username = "admin"
+password = "admin"
 "#;
             fs::write("wolfproxy.toml", default_config).await.unwrap();
             default_config.to_string()
@@ -361,6 +373,12 @@ auto_reload = false
         upstreams.add_upstream(upstream);
     }
     
+    // Create shared upstream manager for monitoring
+    let upstreams_arc = Arc::new(upstreams.clone());
+    
+    // Create traffic stats
+    let traffic_stats = Arc::new(TrafficStats::new());
+    
     // Create HTTP client for proxying with optimized settings
     let http_client = HyperClient::builder(TokioExecutor::new())
         .pool_idle_timeout(Duration::from_secs(90))      // Keep connections alive longer
@@ -369,13 +387,18 @@ auto_reload = false
         .set_host(false)                                  // We set Host header ourselves
         .build_http();
 
+    let vhost_count = vhosts.len();
+    let server_blocks = nginx_config.servers.len();
+    
     let state = Arc::new(AppState {
         config: config.clone(),
         nginx_config,
         vhosts,
         default_vhosts,
         upstreams,
+        upstreams_arc: upstreams_arc.clone(),
         http_client,
+        traffic_stats: traffic_stats.clone(),
     });
     
     let app = Router::new()
@@ -385,6 +408,22 @@ auto_reload = false
 
     let mut tasks = Vec::new();
     let host_ip = config.server.host.clone();
+
+    // Start monitoring server
+    let monitoring_config = config.monitoring.clone();
+    let monitoring_host = host_ip.clone();
+    let monitoring_upstreams = upstreams_arc.clone();
+    let monitoring_stats = traffic_stats.clone();
+    tasks.push(tokio::spawn(async move {
+        monitoring::start_monitoring_server(
+            &monitoring_host,
+            monitoring_config,
+            monitoring_upstreams,
+            monitoring_stats,
+            vhost_count,
+            server_blocks,
+        ).await;
+    }));
 
     // Ensure we have at least the default ports
     if http_ports.is_empty() {
@@ -495,6 +534,9 @@ async fn handle_request(
     headers: HeaderMap,
     req: Request,
 ) -> Response {
+    // Record traffic stats
+    state.traffic_stats.record_request();
+    
     let uri = req.uri().clone();
     let method = req.method().clone();
     let uri_path = uri.path().to_string();
@@ -540,7 +582,17 @@ async fn handle_request(
             v
         },
         None => {
-            warn!("No vhost found for {} on port {}", host_name, port);
+            // Only log as warning if it's a legitimate hostname, use debug for IP-based or empty requests
+            // (these are typically scanners/probes)
+            let is_ip_or_empty = host_name.is_empty() || 
+                host_name.parse::<std::net::IpAddr>().is_ok() ||
+                host_name.chars().all(|c| c.is_ascii_digit() || c == '.');
+            
+            if is_ip_or_empty {
+                debug!("No vhost for direct IP/empty host access: {} on port {} (likely probe/scanner)", host_name, port);
+            } else {
+                warn!("No vhost found for {} on port {}", host_name, port);
+            }
             return (StatusCode::NOT_FOUND, "No server configured for this host").into_response();
         }
     };

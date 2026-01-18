@@ -17,6 +17,7 @@ A high-performance Rust-based reverse proxy server that reads and uses nginx con
 - **Health Checking**: Automatic backend health monitoring with configurable thresholds
 - **SNI Support**: Proper Server Name Indication for multiple SSL domains
 - **HTTP/1.1 & HTTP/2**: Full protocol support
+- **Monitoring Dashboard**: Built-in web interface to monitor upstream servers and traffic (port 5001)
 
 ## Supported nginx Directives
 
@@ -115,6 +116,12 @@ https_port = 443
 [nginx]
 config_dir = "/etc/nginx"
 auto_reload = false
+
+[monitoring]
+enabled = true
+port = 5001
+username = "admin"
+password = "admin"
 ```
 
 The nginx configuration is read from:
@@ -182,6 +189,32 @@ RUST_LOG=debug ./target/release/wolfproxy
 
 Levels: `trace`, `debug`, `info`, `warn`, `error`
 
+## Monitoring Dashboard
+
+WolfProxy includes a built-in monitoring dashboard accessible at `http://your-server:5001/`.
+
+### Features
+- **Real-time stats**: Uptime, total requests, data in/out
+- **Upstream monitoring**: View all backend servers with their status (UP/DOWN)
+- **Health metrics**: Active connections, request counts, failure counts per server
+- **Load balancing info**: Shows load balancing method per upstream group
+- **Auto-refresh**: Dashboard updates every 5 seconds
+- **JSON API**: Available at `/stats` for programmatic access
+
+### Configuration
+
+```toml
+[monitoring]
+enabled = true       # Enable/disable the monitoring server
+port = 5001          # Port for the monitoring interface
+username = "admin"   # HTTP Basic Auth username
+password = "admin"   # HTTP Basic Auth password
+```
+
+### Security
+
+The monitoring dashboard is protected with HTTP Basic Authentication. **Change the default credentials** in production!
+
 ## Comparison with nginx
 
 | Feature | nginx | WolfProxy |
@@ -192,6 +225,7 @@ Levels: `trace`, `debug`, `info`, `warn`, `error`
 | SSL/TLS | Yes | Yes (auto-detect from config) |
 | HTTP/2 | Yes | Yes |
 | Load Balancing | Yes | Yes |
+| Built-in Monitoring | No (requires third-party) | Yes (web dashboard) |
 | Lua Scripting | Yes | No |
 | Module System | Yes | No (but extensible in Rust) |
 
