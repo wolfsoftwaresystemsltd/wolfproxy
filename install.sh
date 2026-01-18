@@ -18,6 +18,51 @@ echo " (C) 2026 Wolf Software Systems Ltd - http://wolf.uk.com"
 echo " Installation Script"
 echo ""
 
+# Function to detect OS and install build dependencies
+install_build_deps() {
+    echo "Checking build dependencies..."
+    
+    # Check if cc/gcc is available
+    if command -v cc >/dev/null 2>&1 || command -v gcc >/dev/null 2>&1; then
+        echo "  Build tools already installed."
+        return 0
+    fi
+    
+    echo "  Build tools (cc/gcc) not found. Installing..."
+    
+    # Detect package manager and install
+    if command -v apt-get >/dev/null 2>&1; then
+        # Debian/Ubuntu
+        echo "  Detected Debian/Ubuntu - using apt"
+        apt-get update -qq
+        apt-get install -y build-essential pkg-config libssl-dev
+    elif command -v dnf >/dev/null 2>&1; then
+        # Fedora/RHEL 8+/CentOS Stream
+        echo "  Detected Fedora/RHEL - using dnf"
+        dnf install -y gcc gcc-c++ make pkg-config openssl-devel
+    elif command -v yum >/dev/null 2>&1; then
+        # RHEL 7/CentOS 7
+        echo "  Detected RHEL/CentOS - using yum"
+        yum install -y gcc gcc-c++ make pkg-config openssl-devel
+    elif command -v pacman >/dev/null 2>&1; then
+        # Arch Linux
+        echo "  Detected Arch Linux - using pacman"
+        pacman -Sy --noconfirm base-devel openssl
+    elif command -v zypper >/dev/null 2>&1; then
+        # openSUSE
+        echo "  Detected openSUSE - using zypper"
+        zypper install -y gcc gcc-c++ make pkg-config libopenssl-devel
+    else
+        echo "  ERROR: Could not detect package manager."
+        echo "  Please install build-essential/gcc manually:"
+        echo "    Debian/Ubuntu: apt install build-essential pkg-config libssl-dev"
+        echo "    Fedora/RHEL:   dnf install gcc gcc-c++ make pkg-config openssl-devel"
+        exit 1
+    fi
+    
+    echo "  Build tools installed successfully."
+}
+
 # Source cargo environment if it exists (use . for POSIX compatibility)
 if [ -f "$HOME/.cargo/env" ]; then
     . "$HOME/.cargo/env"
@@ -31,6 +76,20 @@ if ! command -v cargo >/dev/null 2>&1; then
         echo "Error: Rust/Cargo is not installed."
         echo "Please install Rust from https://rustup.rs/"
         exit 1
+    fi
+fi
+
+# Install build dependencies if needed (requires root)
+if [ "$EUID" -eq 0 ]; then
+    install_build_deps
+else
+    # Check if cc exists, warn if not
+    if ! command -v cc >/dev/null 2>&1 && ! command -v gcc >/dev/null 2>&1; then
+        echo "WARNING: Build tools (cc/gcc) not found."
+        echo "Run this script as root to auto-install, or manually install:"
+        echo "  Debian/Ubuntu: sudo apt install build-essential pkg-config libssl-dev"
+        echo "  Fedora/RHEL:   sudo dnf install gcc gcc-c++ make pkg-config openssl-devel"
+        echo ""
     fi
 fi
 
