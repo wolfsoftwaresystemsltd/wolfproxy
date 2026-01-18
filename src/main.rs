@@ -541,7 +541,10 @@ async fn handle_request(
     if let Some(loc) = location {
         // Check for return directive
         if let Some(code) = loc.return_code {
-            return handle_return(code, loc.return_value.as_deref(), &host_name, &uri_path, scheme);
+            if let Some(response) = handle_return(code, loc.return_value.as_deref(), &host_name, &uri_path, scheme) {
+                return response;
+            }
+            // If handle_return returns None, continue processing (skip redirect)
         }
         
         // Check deny/allow
@@ -683,15 +686,15 @@ fn evaluate_if_condition(condition: &IfCondition, host: &str, path: &str, method
     
     if matched {
         if let Some(code) = condition.return_code {
-            return Some(handle_return(code, condition.return_value.as_deref(), host, path, scheme));
+            return handle_return(code, condition.return_value.as_deref(), host, path, scheme);
         }
     }
     
     None
 }
 
-/// Handle a return directive
-fn handle_return(code: u16, value: Option<&str>, host: &str, path: &str, scheme: &str) -> Response {
+/// Handle a return directive - returns None if redirect should be skipped (already at target)
+fn handle_return(code: u16, value: Option<&str>, host: &str, path: &str, scheme: &str) -> Option<Response> {
     let status = StatusCode::from_u16(code).unwrap_or(StatusCode::OK);
     
     if (300..400).contains(&code) {
@@ -703,13 +706,13 @@ fn handle_return(code: u16, value: Option<&str>, host: &str, path: &str, scheme:
                 .replace("$request_uri", path)
                 .replace("$scheme", scheme);
             
-            // If we're already on HTTPS and the redirect is to the same URL, don't redirect
+            // If we're already on HTTPS and the redirect is to the same URL, skip redirect
             if scheme == "https" && url == format!("https://{}{}", host, path) {
-                // Already on HTTPS at the target URL, don't redirect
-                return (StatusCode::OK, "").into_response();
+                // Already on HTTPS at the target URL, continue normal processing
+                return None;
             }
             
-            Response::builder()
+            Some(Response::builder()
                 .status(status)
                 .header(header::LOCATION, &url)
                 .header(header::CONTENT_TYPE, "text/html")
@@ -717,14 +720,14 @@ fn handle_return(code: u16, value: Option<&str>, host: &str, path: &str, scheme:
                     "<html><head><title>{} Redirect</title></head><body><h1>{}</h1><p>Redirecting to <a href=\"{}\">{}</a></p></body></html>",
                     code, status.canonical_reason().unwrap_or("Redirect"), url, url
                 )))
-                .unwrap()
+                .unwrap())
         } else {
-            (status, "Redirect").into_response()
+            Some((status, "Redirect").into_response())
         }
     } else {
         // Other status codes
         let body = value.unwrap_or("").to_string();
-        (status, body).into_response()
+        Some((status, body).into_response())
     }
 }
 
