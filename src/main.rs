@@ -13,6 +13,7 @@ use axum::{
     Router,
     body::Body,
 };
+use tower::Service;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::collections::HashMap;
@@ -423,7 +424,7 @@ auto_reload = false
                 };
                 
                 loop {
-                    let (stream, _remote_addr) = match listener.accept().await {
+                    let (stream, remote_addr) = match listener.accept().await {
                         Ok(s) => s,
                         Err(_) => continue,
                     };
@@ -435,7 +436,19 @@ auto_reload = false
                         match acceptor.accept(stream).await {
                             Ok(tls_stream) => {
                                 let io = TokioIo::new(tls_stream);
-                                let service = TowerToHyperService { service: app };
+                                // Create a service that injects ConnectInfo
+                                let service = hyper::service::service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
+                                    let mut app = app.clone();
+                                    async move {
+                                        // Insert ConnectInfo extension
+                                        req.extensions_mut().insert(ConnectInfo(remote_addr));
+                                        let req = Request::from(req);
+                                        let resp = app.call(req).await.unwrap_or_else(|_| {
+                                            (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response()
+                                        });
+                                        Ok::<_, std::convert::Infallible>(resp)
+                                    }
+                                });
                                 
                                 if let Err(err) = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
                                     .serve_connection(io, service)
