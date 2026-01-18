@@ -125,6 +125,7 @@ struct Config {
     nginx: NginxConfigSettings,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 struct ServerConfig {
     host: String,
@@ -137,6 +138,7 @@ struct ServerConfig {
 fn default_http_port() -> u16 { 80 }
 fn default_https_port() -> u16 { 443 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 struct NginxConfigSettings {
     #[serde(default = "default_nginx_dir")]
@@ -159,6 +161,7 @@ impl Default for NginxConfigSettings {
 }
 
 /// Virtual host with resolved configuration
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct VirtualHost {
     server_names: Vec<String>,
@@ -209,6 +212,7 @@ impl VirtualHost {
 }
 
 /// Application state
+#[allow(dead_code)]
 struct AppState {
     config: Config,
     nginx_config: NginxConfig,
@@ -467,7 +471,7 @@ async fn handle_request(
     let uri = req.uri().clone();
     let method = req.method().clone();
     let uri_path = uri.path().to_string();
-    let query_string = uri.query().unwrap_or("").to_string();
+    let _query_string = uri.query().unwrap_or("").to_string();
     
     debug!("Request: {} {} from {}", method, uri_path, addr);
     
@@ -571,7 +575,7 @@ async fn handle_request(
 fn find_matching_location<'a>(locations: &'a [LocationBlock], path: &str) -> Option<&'a LocationBlock> {
     let mut best_match: Option<&LocationBlock> = None;
     let mut best_match_len = 0;
-    let mut found_exact = false;
+    let found_exact = false;
     let mut found_priority = false;
     
     for loc in locations {
@@ -769,7 +773,7 @@ async fn handle_proxy(
     
     // Read the request body
     let method = req.method().clone();
-    let (parts, body) = req.into_parts();
+    let (_parts, body) = req.into_parts();
     let body_bytes = match body.collect().await {
         Ok(b) => b.to_bytes(),
         Err(e) => {

@@ -13,6 +13,7 @@ use rand::Rng;
 use crate::nginx::{Upstream, UpstreamServer, LoadBalanceMethod};
 
 /// Health status of a backend server
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct ServerHealth {
     /// Is the server healthy?
@@ -87,28 +88,33 @@ impl BackendServer {
     }
     
     /// Record a successful request
+    #[allow(dead_code)]
     pub fn record_success(&self) {
         self.health.failures.store(0, Ordering::Relaxed);
         self.health.total_requests.fetch_add(1, Ordering::Relaxed);
     }
     
     /// Record a failed request
+    #[allow(dead_code)]
     pub fn record_failure(&self) {
         self.health.failures.fetch_add(1, Ordering::Relaxed);
     }
     
     /// Increment active connections
+    #[allow(dead_code)]
     pub fn connect(&self) {
         self.health.active_connections.fetch_add(1, Ordering::Relaxed);
     }
     
     /// Decrement active connections
+    #[allow(dead_code)]
     pub fn disconnect(&self) {
         self.health.active_connections.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
 /// Load balancer for an upstream group
+#[allow(dead_code)]
 pub struct LoadBalancer {
     pub name: String,
     pub method: LoadBalanceMethod,
@@ -258,6 +264,7 @@ impl LoadBalancer {
     }
     
     /// Get all healthy servers
+    #[allow(dead_code)]
     pub fn healthy_servers(&self) -> Vec<&BackendServer> {
         self.servers.iter()
             .chain(self.backup_servers.iter())
@@ -266,6 +273,7 @@ impl LoadBalancer {
     }
     
     /// Get server by address
+    #[allow(dead_code)]
     pub fn get_server(&self, address: &str) -> Option<&BackendServer> {
         self.servers.iter()
             .chain(self.backup_servers.iter())
@@ -294,6 +302,7 @@ impl UpstreamManager {
         self.upstreams.get(name).cloned()
     }
     
+    #[allow(dead_code)]
     pub fn all(&self) -> &HashMap<String, Arc<LoadBalancer>> {
         &self.upstreams
     }
@@ -306,11 +315,13 @@ impl Default for UpstreamManager {
 }
 
 /// Guard for tracking active connections
+#[allow(dead_code)]
 pub struct ConnectionGuard<'a> {
     server: &'a BackendServer,
 }
 
 impl<'a> ConnectionGuard<'a> {
+    #[allow(dead_code)]
     pub fn new(server: &'a BackendServer) -> Self {
         server.connect();
         Self { server }

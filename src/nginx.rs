@@ -414,7 +414,6 @@ fn parse_server_blocks(content: &str, base_dir: Option<&Path>) -> Vec<ServerBloc
     let mut servers = Vec::new();
     
     // Find server blocks - this is simplified and may need improvement for nested braces
-    let mut depth = 0;
     let mut in_server = false;
     let mut server_content = String::new();
     let mut brace_count = 0;
@@ -425,7 +424,6 @@ fn parse_server_blocks(content: &str, base_dir: Option<&Path>) -> Vec<ServerBloc
         if trimmed.starts_with("server") && trimmed.contains('{') && !in_server {
             in_server = true;
             brace_count = 1;
-            depth = 1;
             server_content.clear();
             // Don't include the "server {" line
             if let Some(brace_idx) = line.find('{') {
