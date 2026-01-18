@@ -6,3 +6,6 @@ Cargo.lock
 *.swp
 *.swo
 *~
+
+# Local deployment script (contains server IPs)
+copyfiles
