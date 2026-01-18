@@ -1014,7 +1014,7 @@ fn expand_proxy_header_value(value: &str, headers: &HeaderMap, client_addr: Sock
         .unwrap_or_else(|| client_addr.ip().to_string());
     result = result.replace("$proxy_add_x_forwarded_for", &xff);
     
-    // $scheme
+    // $scheme - check if connection is HTTPS
     let scheme = if headers.get("x-forwarded-proto")
         .and_then(|h| h.to_str().ok())
         .map(|s| s == "https")
@@ -1024,6 +1024,40 @@ fn expand_proxy_header_value(value: &str, headers: &HeaderMap, client_addr: Sock
         "http"
     };
     result = result.replace("$scheme", scheme);
+    
+    // $http_cookie - the Cookie header value
+    if let Some(cookie) = headers.get("cookie").and_then(|h| h.to_str().ok()) {
+        result = result.replace("$http_cookie", cookie);
+    } else {
+        result = result.replace("$http_cookie", "");
+    }
+    
+    // $http_upgrade - the Upgrade header value (for WebSocket)
+    if let Some(upgrade) = headers.get("upgrade").and_then(|h| h.to_str().ok()) {
+        result = result.replace("$http_upgrade", upgrade);
+    } else {
+        result = result.replace("$http_upgrade", "");
+    }
+    
+    // $http_connection - the Connection header value
+    if let Some(conn) = headers.get("connection").and_then(|h| h.to_str().ok()) {
+        result = result.replace("$http_connection", conn);
+    } else {
+        result = result.replace("$http_connection", "");
+    }
+    
+    // Generic $http_* headers - match any $http_headername pattern
+    let re = regex::Regex::new(r"\$http_([a-z_]+)").ok();
+    if let Some(re) = re {
+        for cap in re.captures_iter(&result.clone()) {
+            let var_name = &cap[0];
+            let header_name = cap[1].replace('_', "-");
+            let header_value = headers.get(&header_name)
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or("");
+            result = result.replace(var_name, header_value);
+        }
+    }
     
     // $request_uri
     // This would need the actual URI from the request
