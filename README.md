@@ -238,6 +238,97 @@ The monitoring dashboard is protected with HTTP Basic Authentication. **Change t
 | Lua Scripting | Yes | No |
 | Module System | Yes | No (but extensible in Rust) |
 
+## WordPress Behind WolfProxy
+
+When running WordPress behind WolfProxy (or any reverse proxy), you may encounter issues such as:
+
+- "Cookies are blocked or not supported by your browser" login errors
+- Redirect loops
+- Mixed content warnings
+- Session issues
+
+### Recommended nginx Configuration for WordPress
+
+For WordPress sites, use this location block configuration:
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name your-wordpress-site.com;
+
+    ssl_certificate /etc/letsencrypt/live/your-wordpress-site.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/your-wordpress-site.com/privkey.pem;
+
+    location / {
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        
+        # Cookie handling for WordPress
+        proxy_set_header Cookie $http_cookie;
+        proxy_pass_header Set-Cookie;
+        proxy_cookie_path / /;
+        
+        # Disable buffering for better cookie handling
+        proxy_buffering off;
+        
+        proxy_pass http://backend_servers;
+    }
+}
+```
+
+### WordPress wp-config.php Settings
+
+Add these lines to your `wp-config.php` file (before "That's all, stop editing!"):
+
+```php
+/**
+ * Reverse Proxy Configuration
+ * Required when WordPress is behind a reverse proxy like WolfProxy
+ */
+
+// Trust the proxy's X-Forwarded-Proto header for HTTPS detection
+if (isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https') {
+    $_SERVER['HTTPS'] = 'on';
+}
+
+// Trust X-Forwarded-For for real client IP
+if (isset($_SERVER['HTTP_X_FORWARDED_FOR'])) {
+    $forwarded_ips = explode(',', $_SERVER['HTTP_X_FORWARDED_FOR']);
+    $_SERVER['REMOTE_ADDR'] = trim($forwarded_ips[0]);
+}
+
+// Force SSL for admin (recommended)
+define('FORCE_SSL_ADMIN', true);
+
+// Optional: Set cookie domain if you have issues with subdomains
+// define('COOKIE_DOMAIN', 'your-wordpress-site.com');
+
+// Optional: Define site URL to prevent redirect loops
+// define('WP_HOME', 'https://your-wordpress-site.com');
+// define('WP_SITEURL', 'https://your-wordpress-site.com');
+```
+
+### Troubleshooting WordPress Cookie Issues
+
+1. **Clear your browser cookies** for the WordPress site after making configuration changes
+
+2. **Check that your site URL is correct** in WordPress Settings → General (Site URL and WordPress URL should both use `https://`)
+
+3. **Verify headers are being passed** by checking your server logs or using browser developer tools to inspect request/response headers
+
+4. **If using load balancing with multiple backends**, ensure you're using `ip_hash` for sticky sessions:
+   ```nginx
+   upstream backend_servers {
+       ip_hash;
+       server 10.0.10.101;
+       server 10.0.10.102;
+   }
+   ```
+
+5. **Check for redirect loops** - if WordPress and your proxy disagree about HTTP vs HTTPS, you'll get infinite redirects. The `X-Forwarded-Proto` header and `wp-config.php` settings above should fix this.
+
 ## License
 
 MIT License - See LICENSE file

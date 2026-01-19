@@ -44,7 +44,7 @@ mod nginx;
 mod upstream;
 mod monitoring;
 
-use nginx::{NginxConfig, ServerBlock, LocationBlock, ProxyHeader, RewriteFlag, IfCondition};
+use nginx::{NginxConfig, ServerBlock, LocationBlock, ProxyHeader, RewriteFlag, IfCondition, LoadBalanceMethod};
 use upstream::UpstreamManager;
 use monitoring::{MonitoringConfig, TrafficStats};
 
@@ -642,6 +642,7 @@ async fn handle_request(
                 loc,
                 &vhost.proxy_headers,
                 addr,
+                is_https,
             ).await;
         }
         
@@ -856,11 +857,23 @@ async fn handle_proxy(
     location: &LocationBlock,
     server_headers: &[ProxyHeader],
     client_addr: SocketAddr,
+    is_https: bool,
 ) -> Response {
     debug!("handle_proxy called with proxy_pass: {}", proxy_pass);
     
     // Track which upstream was used (if any)
     let mut upstream_name_used: Option<String> = None;
+
+    // Detect PHP sessions and capture client IP for optional affinity
+    let php_session = extract_php_session_id(&headers);
+    if let Some(ref session) = php_session {
+        debug!("Detected PHP session cookie ({} chars)", session.len());
+    }
+    let client_ip = headers.get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| client_addr.ip().to_string());
     
     // Parse the proxy_pass URL
     let (backend_url, path_suffix) = if proxy_pass.starts_with("http://") || proxy_pass.starts_with("https://") {
@@ -881,14 +894,17 @@ async fn handle_proxy(
             // It's an upstream reference
             debug!("Found upstream '{}' with {} servers", potential_upstream, lb.servers.len());
             upstream_name_used = Some(potential_upstream.to_string());
-            let client_ip = headers.get("x-forwarded-for")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.split(',').next())
-                .map(|s| s.trim())
-                .unwrap_or(&client_addr.ip().to_string())
-                .to_string();
-            
-            if let Some(server) = lb.next_server(Some(&client_ip)) {
+            let affinity_key = php_session
+                .as_deref()
+                .or_else(|| {
+                    if matches!(lb.method, LoadBalanceMethod::IpHash) {
+                        Some(client_ip.as_str())
+                    } else {
+                        None
+                    }
+                });
+
+            if let Some(server) = lb.next_server(affinity_key) {
                 debug!("Selected backend server: {}", server.url);
                 (server.url.clone(), req.uri().path_and_query().map(|pq| pq.to_string()).unwrap_or_default())
             } else {
@@ -906,14 +922,17 @@ async fn handle_proxy(
         
         if let Some(lb) = state.upstreams.get(upstream_name) {
             upstream_name_used = Some(upstream_name.to_string());
-            let client_ip = headers.get("x-forwarded-for")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.split(',').next())
-                .map(|s| s.trim())
-                .unwrap_or(&client_addr.ip().to_string())
-                .to_string();
-            
-            if let Some(server) = lb.next_server(Some(&client_ip)) {
+            let affinity_key = php_session
+                .as_deref()
+                .or_else(|| {
+                    if matches!(lb.method, LoadBalanceMethod::IpHash) {
+                        Some(client_ip.as_str())
+                    } else {
+                        None
+                    }
+                });
+
+            if let Some(server) = lb.next_server(affinity_key) {
                 debug!("Selected backend server: {}", server.url);
                 (server.url.clone(), req.uri().path_and_query().map(|pq| pq.to_string()).unwrap_or_default())
             } else {
@@ -976,7 +995,7 @@ async fn handle_proxy(
     
     // Apply proxy_set_header directives from location first
     for ph in &location.proxy_headers {
-        let value = expand_proxy_header_value(&ph.value, &headers, client_addr);
+        let value = expand_proxy_header_value(&ph.value, &headers, client_addr, is_https);
         custom_headers.insert(ph.name.to_lowercase(), value);
     }
     
@@ -984,7 +1003,7 @@ async fn handle_proxy(
     for ph in server_headers {
         let key = ph.name.to_lowercase();
         if !custom_headers.contains_key(&key) {
-            let value = expand_proxy_header_value(&ph.value, &headers, client_addr);
+            let value = expand_proxy_header_value(&ph.value, &headers, client_addr, is_https);
             custom_headers.insert(key, value);
         }
     }
@@ -1066,8 +1085,25 @@ async fn handle_proxy(
     })
 }
 
+/// Extract PHP session id (PHPSESSID) from Cookie headers if present
+fn extract_php_session_id(headers: &HeaderMap) -> Option<String> {
+    for value in headers.get_all("cookie").iter() {
+        if let Ok(cookie_str) = value.to_str() {
+            for pair in cookie_str.split(';') {
+                let mut parts = pair.trim().splitn(2, '=');
+                let name = parts.next().unwrap_or("").trim();
+                let val = parts.next().unwrap_or("").trim();
+                if name.eq_ignore_ascii_case("phpsessid") && !val.is_empty() {
+                    return Some(val.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Expand nginx variables in proxy header values
-fn expand_proxy_header_value(value: &str, headers: &HeaderMap, client_addr: SocketAddr) -> String {
+fn expand_proxy_header_value(value: &str, headers: &HeaderMap, client_addr: SocketAddr, is_https: bool) -> String {
     let mut result = value.to_string();
     
     // $http_host
@@ -1091,15 +1127,8 @@ fn expand_proxy_header_value(value: &str, headers: &HeaderMap, client_addr: Sock
         .unwrap_or_else(|| client_addr.ip().to_string());
     result = result.replace("$proxy_add_x_forwarded_for", &xff);
     
-    // $scheme - check if connection is HTTPS
-    let scheme = if headers.get("x-forwarded-proto")
-        .and_then(|h| h.to_str().ok())
-        .map(|s| s == "https")
-        .unwrap_or(false) {
-        "https"
-    } else {
-        "http"
-    };
+    // $scheme - use actual connection HTTPS status
+    let scheme = if is_https { "https" } else { "http" };
     result = result.replace("$scheme", scheme);
     
     // $http_cookie - the Cookie header value

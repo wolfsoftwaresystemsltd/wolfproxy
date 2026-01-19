@@ -356,7 +356,9 @@ fn parse_upstreams(content: &str) -> HashMap<String, Upstream> {
                 }
             } else if line.starts_with("server") {
                 if let Some(server) = parse_upstream_server(line) {
-                    if server.weight > 1 {
+                    // Only switch to weighted if no explicit method was set earlier
+                    // (ip_hash/least_conn/random should remain as declared)
+                    if server.weight > 1 && matches!(upstream.method, LoadBalanceMethod::RoundRobin) {
                         upstream.method = LoadBalanceMethod::WeightedRoundRobin;
                     }
                     upstream.servers.push(server);

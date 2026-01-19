@@ -122,8 +122,8 @@ pub struct LoadBalancer {
     pub backup_servers: Vec<BackendServer>,
     /// Current index for round-robin
     current_index: AtomicUsize,
-    /// IP hash cache
-    ip_hash_cache: DashMap<String, usize>,
+    /// Affinity cache keyed by IP or session identifier
+    affinity_cache: DashMap<String, usize>,
     /// Keepalive connections count
     pub keepalive: Option<u32>,
 }
@@ -148,23 +148,23 @@ impl LoadBalancer {
             servers,
             backup_servers,
             current_index: AtomicUsize::new(0),
-            ip_hash_cache: DashMap::new(),
+            affinity_cache: DashMap::new(),
             keepalive: upstream.keepalive,
         }
     }
     
     /// Get the next available backend server
-    pub fn next_server(&self, client_ip: Option<&str>) -> Option<&BackendServer> {
+    pub fn next_server(&self, affinity_key: Option<&str>) -> Option<&BackendServer> {
         // Try primary servers first
-        if let Some(server) = self.select_server(&self.servers, client_ip) {
+        if let Some(server) = self.select_server(&self.servers, affinity_key) {
             return Some(server);
         }
         
         // Fall back to backup servers
-        self.select_server(&self.backup_servers, client_ip)
+        self.select_server(&self.backup_servers, affinity_key)
     }
     
-    fn select_server<'a>(&'a self, servers: &'a [BackendServer], client_ip: Option<&str>) -> Option<&'a BackendServer> {
+    fn select_server<'a>(&'a self, servers: &'a [BackendServer], affinity_key: Option<&str>) -> Option<&'a BackendServer> {
         let available: Vec<usize> = servers.iter()
             .enumerate()
             .filter(|(_, s)| s.is_available())
@@ -173,6 +173,13 @@ impl LoadBalancer {
         
         if available.is_empty() {
             return None;
+        }
+
+        // If we have an affinity key (e.g., PHPSESSID), pin to the hashed server when healthy
+        if let Some(key) = affinity_key {
+            if let Some(server) = self.sticky_by_key(servers, &available, key) {
+                return Some(server);
+            }
         }
         
         let index = match &self.method {
@@ -183,11 +190,8 @@ impl LoadBalancer {
                 self.weighted_round_robin(servers, &available)
             }
             LoadBalanceMethod::IpHash => {
-                if let Some(ip) = client_ip {
-                    self.ip_hash(ip, &available)
-                } else {
-                    self.round_robin(&available)
-                }
+                let key = affinity_key.unwrap_or("default");
+                self.hash_by_key(&available, key)
             }
             LoadBalanceMethod::LeastConn => {
                 self.least_connections(servers, &available)
@@ -223,24 +227,43 @@ impl LoadBalancer {
         weighted_available[idx % weighted_available.len()]
     }
     
-    fn ip_hash(&self, ip: &str, available: &[usize]) -> usize {
+    fn hash_by_key(&self, available: &[usize], key: &str) -> usize {
+        let mut hasher = FnvHasher::default();
+        key.hash(&mut hasher);
+        let hash = hasher.finish() as usize;
+        available[hash % available.len()]
+    }
+
+    fn sticky_by_key<'a>(&'a self, servers: &'a [BackendServer], available: &[usize], key: &str) -> Option<&'a BackendServer> {
         // Check cache first
-        if let Some(cached) = self.ip_hash_cache.get(ip) {
+        if let Some(cached) = self.affinity_cache.get(key) {
             if available.contains(&*cached) {
-                return *cached;
+                return servers.get(*cached);
             }
         }
-        
-        // Compute hash
-        let mut hasher = FnvHasher::default();
-        ip.hash(&mut hasher);
-        let hash = hasher.finish() as usize;
-        let idx = available[hash % available.len()];
-        
-        // Cache the result
-        self.ip_hash_cache.insert(ip.to_string(), idx);
-        
-        idx
+
+        // Build weighted pool so affinity respects weights
+        let mut weighted: Vec<usize> = Vec::new();
+        for &idx in available {
+            let weight = servers
+                .get(idx)
+                .map(|s| s.config.weight.max(1) as usize)
+                .unwrap_or(1);
+            for _ in 0..weight {
+                weighted.push(idx);
+            }
+        }
+
+        let pool: Vec<usize> = if weighted.is_empty() {
+            available.to_vec()
+        } else {
+            weighted
+        };
+
+        let selected = self.hash_by_key(&pool, key);
+        self.affinity_cache.insert(key.to_string(), selected);
+
+        servers.get(selected)
     }
     
     fn least_connections(&self, servers: &[BackendServer], available: &[usize]) -> usize {
@@ -391,6 +414,17 @@ mod tests {
         let s1 = lb.next_server(Some("192.168.1.1")).unwrap();
         let s2 = lb.next_server(Some("192.168.1.1")).unwrap();
         
+        assert_eq!(s1.config.address, s2.config.address);
+    }
+
+    #[test]
+    fn test_session_affinity() {
+        let upstream = make_upstream();
+        let lb = LoadBalancer::new(&upstream);
+
+        // Same session id should stick to the same backend
+        let s1 = lb.next_server(Some("php-session-123")).unwrap();
+        let s2 = lb.next_server(Some("php-session-123")).unwrap();
         assert_eq!(s1.config.address, s2.config.address);
     }
 }
