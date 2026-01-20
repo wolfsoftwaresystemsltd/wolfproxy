@@ -1,5 +1,7 @@
 # WolfProxy
 
+[![Support me on Patreon](https://img.shields.io/badge/Patreon-Support%20Me-F96854?style=for-the-badge&logo=patreon&logoColor=white)](https://www.patreon.com/15362110/join)
+
 A high-performance Rust-based reverse proxy server that reads and uses nginx configuration files directly.
 
 **(C) 2025 Wolf Software Systems Ltd - http://wolf.uk.com**
