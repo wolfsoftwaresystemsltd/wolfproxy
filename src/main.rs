@@ -981,18 +981,20 @@ async fn handle_proxy(
         }
     };
     
-    // Build proxy request
+    // Build proxy request - use HTTP/1.1 like nginx does
     let mut proxy_req = hyper::Request::builder()
         .method(method.clone())
-        .uri(&uri);
+        .uri(&uri)
+        .version(hyper::Version::HTTP_11);
     
     // Copy headers
     for (name, value) in headers.iter() {
-        // Skip hop-by-hop headers
+        // Skip hop-by-hop headers and content-length (hyper will calculate from body)
         let name_str = name.as_str().to_lowercase();
         if name_str == "host" || name_str == "connection" || name_str == "keep-alive" ||
            name_str == "transfer-encoding" || name_str == "te" || name_str == "trailer" ||
-           name_str == "upgrade" || name_str == "proxy-authorization" || name_str == "proxy-connection" {
+           name_str == "upgrade" || name_str == "proxy-authorization" || name_str == "proxy-connection" ||
+           name_str == "content-length" {
             continue;
         }
         proxy_req = proxy_req.header(name, value);
@@ -1028,18 +1030,17 @@ async fn handle_proxy(
         }
     }
     
-    // Apply all custom headers
+    // Apply custom headers - skip empty values (nginx uses "" to mean "don't send this header")
     for (name, value) in &custom_headers {
+        if value.is_empty() {
+            // Empty value means don't send this header - skip it
+            continue;
+        }
         if let Ok(hv) = HeaderValue::from_str(value) {
             if let Ok(hn) = HeaderName::from_str(name) {
                 proxy_req = proxy_req.header(hn, hv);
             }
         }
-    }
-    
-    // Set HTTP version header if specified
-    if !location.proxy_http_version.is_empty() {
-        proxy_req = proxy_req.header("Connection", "");
     }
     
     let proxy_req = match proxy_req.body(Full::new(body_bytes)) {
@@ -1109,7 +1110,7 @@ async fn handle_proxy(
         }
     };
     
-    // Build response - stream the body instead of buffering
+    // Build response
     let status = response.status();
     let resp_headers = response.headers().clone();
     

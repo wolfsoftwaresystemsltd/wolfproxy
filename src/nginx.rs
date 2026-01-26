@@ -612,9 +612,12 @@ fn parse_location_content(loc: &mut LocationBlock, content: &str) {
         } else if trimmed.starts_with("proxy_set_header") {
             let parts: Vec<&str> = trimmed.splitn(3, char::is_whitespace).collect();
             if parts.len() >= 3 {
+                let value = parts[2].trim_end_matches(';')
+                    .trim_matches('"')  // Remove surrounding quotes
+                    .trim_matches('\''); // Also handle single quotes
                 loc.proxy_headers.push(ProxyHeader {
                     name: parts[1].to_string(),
-                    value: parts[2].trim_end_matches(';').to_string(),
+                    value: value.to_string(),
                 });
             }
         } else if trimmed.starts_with("proxy_http_version") {
@@ -833,9 +836,12 @@ fn parse_server_directive(server: &mut ServerBlock, line: &str, base_dir: Option
     } else if line.starts_with("proxy_set_header") {
         let parts: Vec<&str> = line.splitn(3, char::is_whitespace).collect();
         if parts.len() >= 3 {
+            let value = parts[2].trim_end_matches(';')
+                .trim_matches('"')  // Remove surrounding quotes
+                .trim_matches('\''); // Also handle single quotes
             server.proxy_headers.push(ProxyHeader {
                 name: parts[1].to_string(),
-                value: parts[2].trim_end_matches(';').to_string(),
+                value: value.to_string(),
             });
         }
     } else if line.starts_with("include") {

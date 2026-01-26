@@ -6,7 +6,7 @@ https_port = 443
 [nginx]
 # Path to nginx configuration directory
 # WolfProxy will read from sites-enabled and conf.d
-config_dir = "/etc/nginx"
+config_dir = "/home/paulc/NetBeansProjects/wolfproxy"
 
 # Automatically reload configuration when files change
 auto_reload = false
