@@ -26,6 +26,7 @@ use tokio::fs;
 use tokio::time::Duration;
 
 use hyper_util::client::legacy::Client as HyperClient;
+use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use http_body_util::{BodyExt, Full};
 use bytes::Bytes;
@@ -379,13 +380,19 @@ password = "admin"
     // Create traffic stats
     let traffic_stats = Arc::new(TrafficStats::new());
     
+    // Create HTTP connector with explicit configuration
+    let mut connector = HttpConnector::new();
+    connector.set_nodelay(true);           // Disable Nagle's algorithm for lower latency
+    connector.enforce_http(false);          // Allow HTTPS URLs too
+    connector.set_keepalive(Some(Duration::from_secs(60))); // TCP keepalive
+    
     // Create HTTP client for proxying with optimized settings
     let http_client = HyperClient::builder(TokioExecutor::new())
         .pool_idle_timeout(Duration::from_secs(90))      // Keep connections alive longer
         .pool_max_idle_per_host(100)                      // More idle connections per backend
         .retry_canceled_requests(true)                    // Retry if connection was closed
         .set_host(false)                                  // We set Host header ourselves
-        .build_http();
+        .build(connector);
 
     let vhost_count = vhosts.len();
     let server_blocks = nginx_config.servers.len();
@@ -964,6 +971,7 @@ async fn handle_proxy(
     
     // Read the request body
     let method = req.method().clone();
+    let original_uri = req.uri().clone();
     let (_parts, body) = req.into_parts();
     let body_bytes = match body.collect().await {
         Ok(b) => b.to_bytes(),
@@ -1043,13 +1051,61 @@ async fn handle_proxy(
     };
     
     // Send the request
-    debug!("Proxying to {}", uri);
+    info!("Proxying {} {} -> {}", method, original_uri, uri);
+    
+    let backend_host = uri.host().unwrap_or("unknown");
+    let backend_port = uri.port_u16().unwrap_or(80);
+    let backend_addr = format!("{}:{}", backend_host, backend_port);
     
     let response = match state.http_client.request(proxy_req).await {
         Ok(r) => r,
         Err(e) => {
-            error!("Proxy request failed: {}", e);
-            return (StatusCode::BAD_GATEWAY, format!("Upstream error: {}", e)).into_response();
+            // Provide detailed error information for troubleshooting
+            let error_details = format!("{:?}", e);
+            let error_lower = error_details.to_lowercase();
+            
+            let (status, message) = if error_lower.contains("connecterror") || error_lower.contains("connect") {
+                // Connection refused, network unreachable, etc.
+                if error_lower.contains("refused") {
+                    (StatusCode::BAD_GATEWAY, format!(
+                        "Connection refused to backend {} - check if the service is running on that port", 
+                        backend_addr
+                    ))
+                } else if error_lower.contains("unreachable") || error_lower.contains("no route") {
+                    (StatusCode::BAD_GATEWAY, format!(
+                        "Network unreachable to backend {} - check network/firewall configuration", 
+                        backend_addr
+                    ))
+                } else {
+                    (StatusCode::BAD_GATEWAY, format!(
+                        "Cannot connect to backend {} - verify the server is reachable and port is open", 
+                        backend_addr
+                    ))
+                }
+            } else if error_lower.contains("dns") || error_lower.contains("resolve") || error_lower.contains("lookup") {
+                (StatusCode::BAD_GATEWAY, format!(
+                    "DNS resolution failed for '{}' - check hostname or use IP address", 
+                    backend_host
+                ))
+            } else if error_lower.contains("timeout") || error_lower.contains("timedout") {
+                (StatusCode::GATEWAY_TIMEOUT, format!(
+                    "Connection timeout to backend {} - server may be overloaded or unreachable", 
+                    backend_addr
+                ))
+            } else if error_lower.contains("reset") {
+                (StatusCode::BAD_GATEWAY, format!(
+                    "Connection reset by backend {} - service may have crashed or rejected the connection", 
+                    backend_addr
+                ))
+            } else {
+                (StatusCode::BAD_GATEWAY, format!(
+                    "Upstream error connecting to {}: {}", 
+                    backend_addr, e
+                ))
+            };
+            
+            error!("Proxy request failed: {} -> {} : {} (raw: {})", original_uri, backend_addr, message, error_details);
+            return (status, message).into_response();
         }
     };
     
