@@ -1052,7 +1052,7 @@ async fn handle_proxy(
     };
     
     // Send the request
-    info!("Proxying {} {} -> {}", method, original_uri, uri);
+    debug!("Proxying {} {} -> {}", method, original_uri, uri);
     
     let backend_host = uri.host().unwrap_or("unknown");
     let backend_port = uri.port_u16().unwrap_or(80);
