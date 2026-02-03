@@ -49,6 +49,8 @@ pub enum LoadBalanceMethod {
     LeastConn,
     Random,
     WeightedRoundRobin,
+    /// WolfScale cluster mode: writes go to leader, reads are load balanced
+    WolfScale,
 }
 
 /// Represents an upstream block
@@ -349,6 +351,8 @@ fn parse_upstreams(content: &str) -> HashMap<String, Upstream> {
                 upstream.method = LoadBalanceMethod::LeastConn;
             } else if line.starts_with("random") {
                 upstream.method = LoadBalanceMethod::Random;
+            } else if line.starts_with("wolfscale") {
+                upstream.method = LoadBalanceMethod::WolfScale;
             } else if line.starts_with("keepalive") {
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 if parts.len() >= 2 {

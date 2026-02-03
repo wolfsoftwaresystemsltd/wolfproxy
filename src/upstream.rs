@@ -9,8 +9,22 @@ use std::hash::{Hash, Hasher};
 use dashmap::DashMap;
 use fnv::FnvHasher;
 use rand::Rng;
+use tokio::sync::RwLock;
+use hyper::http::Method;
 
 use crate::nginx::{Upstream, UpstreamServer, LoadBalanceMethod};
+
+/// WolfScale cluster state tracking
+/// Tracks which server is the current leader for write routing
+#[derive(Debug)]
+pub struct WolfScaleState {
+    /// Index of the current leader in the servers list
+    pub leader_index: RwLock<Option<usize>>,
+    /// Last time we refreshed leader info
+    pub last_refresh: RwLock<Instant>,
+    /// Refresh interval (default 1 second)
+    pub refresh_interval: Duration,
+}
 
 /// Health status of a backend server
 #[allow(dead_code)]
@@ -126,6 +140,8 @@ pub struct LoadBalancer {
     affinity_cache: DashMap<String, usize>,
     /// Keepalive connections count
     pub keepalive: Option<u32>,
+    /// WolfScale cluster state (only used when method is WolfScale)
+    pub wolfscale_state: Option<Arc<WolfScaleState>>,
 }
 
 impl LoadBalancer {
@@ -142,6 +158,17 @@ impl LoadBalancer {
             }
         }
         
+        // Create WolfScale state if needed
+        let wolfscale_state = if matches!(upstream.method, LoadBalanceMethod::WolfScale) {
+            Some(Arc::new(WolfScaleState {
+                leader_index: RwLock::new(None),
+                last_refresh: RwLock::new(Instant::now()),
+                refresh_interval: Duration::from_secs(1),
+            }))
+        } else {
+            None
+        };
+        
         Self {
             name: upstream.name.clone(),
             method: upstream.method.clone(),
@@ -150,6 +177,7 @@ impl LoadBalancer {
             current_index: AtomicUsize::new(0),
             affinity_cache: DashMap::new(),
             keepalive: upstream.keepalive,
+            wolfscale_state,
         }
     }
     
@@ -198,6 +226,11 @@ impl LoadBalancer {
             }
             LoadBalanceMethod::Random => {
                 self.random(&available)
+            }
+            LoadBalanceMethod::WolfScale => {
+                // For reads, use round-robin across all available servers
+                // Write routing is handled separately via next_server_for_method
+                self.round_robin(&available)
             }
         };
         
@@ -284,6 +317,75 @@ impl LoadBalancer {
     fn random(&self, available: &[usize]) -> usize {
         let mut rng = rand::thread_rng();
         available[rng.gen_range(0..available.len())]
+    }
+    
+    /// Get the next available backend server, considering HTTP method for WolfScale mode
+    /// For WolfScale upstreams:
+    /// - Write methods (POST, PUT, DELETE, PATCH) go to the leader
+    /// - Read methods (GET, HEAD, OPTIONS) are load balanced
+    pub fn next_server_for_method(&self, affinity_key: Option<&str>, method: Option<&Method>) -> Option<&BackendServer> {
+        // If not WolfScale mode, use normal server selection
+        if !matches!(self.method, LoadBalanceMethod::WolfScale) {
+            return self.next_server(affinity_key);
+        }
+        
+        // Check if this is a write request
+        let is_write = method.map(|m| {
+            matches!(m, &Method::POST | &Method::PUT | &Method::DELETE | &Method::PATCH)
+        }).unwrap_or(false);
+        
+        if is_write {
+            // For writes, use the leader if we know it
+            if let Some(ref state) = self.wolfscale_state {
+                // Try to get cached leader synchronously (blocking read)
+                // In real async context, caller should use async version
+                if let Ok(leader_guard) = state.leader_index.try_read() {
+                    if let Some(leader_idx) = *leader_guard {
+                        if leader_idx < self.servers.len() {
+                            let server = &self.servers[leader_idx];
+                            if server.is_available() {
+                                return Some(server);
+                            }
+                        }
+                    }
+                }
+            }
+            // Fall back to first available server if leader unknown
+            // The first server is typically the one with lowest priority/ID
+            return self.servers.iter().find(|s| s.is_available());
+        }
+        
+        // For reads, load balance across all servers
+        self.next_server(affinity_key)
+    }
+    
+    /// Set the current WolfScale leader by server index
+    pub async fn set_leader_index(&self, index: usize) {
+        if let Some(ref state) = self.wolfscale_state {
+            let mut leader = state.leader_index.write().await;
+            *leader = Some(index);
+            let mut last_refresh = state.last_refresh.write().await;
+            *last_refresh = Instant::now();
+        }
+    }
+    
+    /// Find server index by address/hostname
+    pub fn find_server_index(&self, address: &str) -> Option<usize> {
+        self.servers.iter().position(|s| {
+            s.config.address == address || 
+            s.url.contains(address) ||
+            address.contains(&s.config.address)
+        })
+    }
+    
+    /// Check if WolfScale leader info needs refresh
+    pub async fn needs_leader_refresh(&self) -> bool {
+        if let Some(ref state) = self.wolfscale_state {
+            let last_refresh = state.last_refresh.read().await;
+            last_refresh.elapsed() > state.refresh_interval
+        } else {
+            false
+        }
     }
     
     /// Get all healthy servers

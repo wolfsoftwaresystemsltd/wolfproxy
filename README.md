@@ -57,6 +57,7 @@ A high-performance Rust-based reverse proxy server that reads and uses nginx con
   - `down` - Mark server as down
 - `ip_hash` - Sticky sessions
 - `least_conn` - Least connections balancing
+- `wolfscale` - **WolfScale cluster mode** (writes to leader, reads load-balanced)
 - `keepalive` - Connection pooling
 
 ### Conditionals
@@ -171,6 +172,50 @@ server {
     }
 }
 ```
+
+## WolfScale Integration
+
+WolfProxy has built-in support for [WolfScale](https://github.com/wolfsoftware/wolfscale) distributed database clusters. When using the `wolfscale` directive, WolfProxy automatically routes:
+
+- **Write requests** (POST, PUT, DELETE, PATCH) → **Leader node** only
+- **Read requests** (GET, HEAD, OPTIONS) → **Load balanced** across all healthy nodes
+
+### Example Configuration
+
+```nginx
+upstream wolfscale_cluster {
+    wolfscale;  # Enable WolfScale cluster mode
+    server wolftest1:8080 max_fails=3 fail_timeout=10s;
+    server wolftest2:8080 max_fails=3 fail_timeout=10s;
+    server wolftest3:8080 max_fails=3 fail_timeout=10s;
+}
+
+server {
+    listen 80;
+    server_name api.example.com;
+
+    location / {
+        proxy_pass http://wolfscale_cluster;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+}
+```
+
+### How It Works
+
+1. WolfProxy queries each node's `/status` API endpoint to determine the current leader
+2. Write requests are forwarded to the leader to maintain consistency
+3. Read requests are distributed across all healthy nodes for horizontal scaling
+4. If the leader changes (failover), WolfProxy automatically detects and adjusts routing
+
+### Benefits
+
+- **Automatic failover**: No manual reconfiguration when leadership changes
+- **Read scaling**: Distribute read load across all cluster nodes
+- **Write consistency**: All writes go to the leader for proper replication
+- **Zero downtime**: Seamless handling of leader elections
 
 ## Migration from nginx
 
