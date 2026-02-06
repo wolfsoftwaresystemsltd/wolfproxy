@@ -4,7 +4,7 @@
 
 A high-performance Rust-based reverse proxy server that reads and uses nginx configuration files directly.
 
-**(C) 2025 Wolf Software Systems Ltd - http://wolf.uk.com**
+**(C) 2026 Wolf Software Systems Ltd - http://wolf.uk.com**
 
 ## Features
 
