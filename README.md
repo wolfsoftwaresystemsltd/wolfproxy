@@ -21,6 +21,62 @@ A high-performance Rust-based reverse proxy server that reads and uses nginx con
 - **HTTP/1.1 & HTTP/2**: Full protocol support
 - **Monitoring Dashboard**: Built-in web interface to monitor upstream servers and traffic (port 5001)
 
+## Quick Install
+
+Install WolfProxy with a single command:
+
+```bash
+curl -sL https://raw.githubusercontent.com/wolfsoftwaresystemsltd/wolfproxy/main/setup.sh | sudo bash
+```
+
+Or using wget:
+
+```bash
+wget -qO- https://raw.githubusercontent.com/wolfsoftwaresystemsltd/wolfproxy/main/setup.sh | sudo bash
+```
+
+### What the Installer Does
+
+The one-line installer performs the following steps automatically:
+
+1. **Detects your package manager** (apt, dnf, yum, pacman, or zypper)
+2. **Installs build dependencies:**
+   - **Debian/Ubuntu (apt):** `build-essential pkg-config libssl-dev git curl`
+   - **RHEL/Fedora (dnf/yum):** `gcc gcc-c++ make pkg-config openssl-devel git curl`
+   - **Arch (pacman):** `base-devel openssl git curl`
+   - **openSUSE (zypper):** `gcc gcc-c++ make pkg-config libopenssl-devel git curl`
+3. **Installs Rust** via rustup if not already present
+4. **Clones the repository** to `/opt/wolfproxy` (or updates if already installed)
+5. **Builds WolfProxy** in release mode
+6. **Creates the systemd service** (`/etc/systemd/system/wolfproxy.service`)
+7. **Creates default configuration** (`/opt/wolfproxy/wolfproxy.toml`)
+
+### After Installation
+
+```bash
+# Stop nginx first (WolfProxy replaces nginx)
+sudo systemctl stop nginx && sudo systemctl disable nginx
+
+# Start WolfProxy
+sudo systemctl start wolfproxy
+
+# Enable on boot
+sudo systemctl enable wolfproxy
+
+# View logs
+journalctl -u wolfproxy -f
+```
+
+### Installation Paths
+
+| Item | Path |
+|------|------|
+| Binary | `/opt/wolfproxy/target/release/wolfproxy` |
+| Configuration | `/opt/wolfproxy/wolfproxy.toml` |
+| Service | `/etc/systemd/system/wolfproxy.service` |
+
+For manual installation, see [Installation](#installation) below.
+
 ## Supported nginx Directives
 
 ### Server Block
