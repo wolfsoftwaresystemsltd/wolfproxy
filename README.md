@@ -10,6 +10,7 @@ A high-performance Rust-based reverse proxy server that reads and uses nginx con
 
 - **Drop-in nginx replacement**: Reads nginx sites-enabled configuration directly
 - **Automatic SSL/TLS**: Automatically picks up SSL certificates from nginx config (Let's Encrypt, etc.)
+- **Built-in Firewall**: Automatic IP blocking for TLS abuse, path traversal, and rate limiting
 - **Load Balancing**: Full upstream support with multiple algorithms:
   - Round Robin
   - Weighted Round Robin
@@ -281,6 +282,51 @@ You can change the monitoring credentials in two ways:
 ### Security
 
 The monitoring dashboard is protected with HTTP Basic Authentication. **Change the default credentials** in production!
+
+## Firewall (Auto-Ban)
+
+WolfProxy includes a built-in firewall that automatically detects and blocks malicious IPs. No configuration needed — it's enabled by default.
+
+### What Gets Blocked
+
+| Threat | Default Threshold | Description |
+|--------|-------------------|-------------|
+| **TLS Abuse** | 10 failures / 60s | Repeated failed TLS handshakes (scanners, bots) |
+| **Path Traversal** | 3 attempts / 60s | `../` in URLs (always malicious) |
+| **Rate Limiting** | 500 requests / 60s | Excessive request rate from single IP |
+| **Bad Requests** | 50 errors / 60s | Too many 4xx responses |
+
+Blocked IPs are banned for **10 minutes** by default. Bans expire automatically.
+
+### How It Works
+
+1. **Pre-TLS blocking**: Blocked IPs are rejected at the TCP level *before* the TLS handshake, saving CPU
+2. **Automatic cleanup**: Expired bans and stale trackers are cleaned up every 60 seconds
+3. **Memory-safe**: Hard caps prevent memory exhaustion (max 10,000 blocked IPs, 50,000 tracked IPs)
+4. **Localhost exempt**: `127.0.0.1` / `::1` are never blocked
+
+### Configuration
+
+Add a `[firewall]` section to `wolfproxy.toml` to customize (all values are optional):
+
+```toml
+[firewall]
+enabled = true              # Enable/disable the firewall
+window_secs = 60            # Time window for counting violations
+ban_duration_secs = 600     # Ban duration (10 minutes)
+tls_failure_threshold = 10  # TLS failures before ban
+bad_request_threshold = 50  # 4xx errors before ban
+rate_limit = 500            # Max requests per window per IP
+traversal_threshold = 3     # Path traversal attempts before ban
+```
+
+### Disabling the Firewall
+
+```toml
+[firewall]
+enabled = false
+```
+
 
 ## Comparison with nginx
 

@@ -44,10 +44,12 @@ use tower_http::compression::CompressionLayer;
 mod nginx;
 mod upstream;
 mod monitoring;
+mod firewall;
 
 use nginx::{NginxConfig, ServerBlock, LocationBlock, ProxyHeader, RewriteFlag, IfCondition, LoadBalanceMethod};
 use upstream::UpstreamManager;
 use monitoring::{MonitoringConfig, TrafficStats};
+use firewall::{Firewall, FirewallConfig};
 
 use hyper_util::rt::TokioIo;
 
@@ -135,6 +137,8 @@ struct Config {
     nginx: NginxConfigSettings,
     #[serde(default)]
     monitoring: MonitoringConfig,
+    #[serde(default)]
+    firewall: FirewallConfig,
 }
 
 #[allow(dead_code)]
@@ -234,6 +238,7 @@ struct AppState {
     upstreams_arc: Arc<UpstreamManager>,
     http_client: HyperClient<hyper_util::client::legacy::connect::HttpConnector, Full<Bytes>>,
     traffic_stats: Arc<TrafficStats>,
+    firewall: Arc<Firewall>,
 }
 
 /// Check if error is a common connection error (for logging purposes)
@@ -404,6 +409,9 @@ password = "admin"
     let vhost_count = vhosts.len();
     let server_blocks = nginx_config.servers.len();
     
+    let firewall = Arc::new(Firewall::new(config.firewall.clone()));
+    info!("🛡️ Firewall {}", if config.firewall.enabled { "enabled" } else { "disabled" });
+
     let state = Arc::new(AppState {
         config: config.clone(),
         nginx_config,
@@ -413,6 +421,17 @@ password = "admin"
         upstreams_arc: upstreams_arc.clone(),
         http_client,
         traffic_stats: traffic_stats.clone(),
+        firewall: firewall.clone(),
+    });
+
+    // Spawn firewall cleanup task (runs every 60 seconds)
+    let fw_cleanup = firewall.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            fw_cleanup.cleanup();
+        }
     });
     
     let app = Router::new()
@@ -479,6 +498,7 @@ password = "admin"
             let addr: SocketAddr = format!("{}:{}", host_ip, port).parse().unwrap();
             let app_clone = app.clone();
             let tls_config_clone = tls_config.clone();
+            let state_clone = state.clone();
             
             tasks.push(tokio::spawn(async move {
                 info!("WolfProxy HTTPS listening on {}", addr);
@@ -491,14 +511,22 @@ password = "admin"
                     }
                 };
                 
+                let fw = state_clone.firewall.clone();
                 loop {
                     let (stream, remote_addr) = match listener.accept().await {
                         Ok(s) => s,
                         Err(_) => continue,
                     };
                     
+                    // Check firewall BEFORE doing expensive TLS handshake
+                    if fw.is_blocked(&remote_addr.ip()) {
+                        drop(stream); // Immediately close connection
+                        continue;
+                    }
+                    
                     let acceptor = tls_acceptor.clone();
                     let app = app_clone.clone();
+                    let fw_inner = fw.clone();
                     
                     tokio::spawn(async move {
                         // TLS handshake timeout - 10 seconds to complete handshake
@@ -508,12 +536,15 @@ password = "admin"
                         ).await {
                             Ok(Ok(s)) => s,
                             Ok(Err(e)) => {
+                                // Record TLS failure for firewall
+                                fw_inner.record_tls_failure(remote_addr.ip());
                                 if !is_common_connection_error(&e) {
                                     warn!("TLS Accept Error: {}", e);
                                 }
                                 return;
                             }
                             Err(_) => {
+                                fw_inner.record_tls_failure(remote_addr.ip());
                                 debug!("TLS handshake timeout from {}", remote_addr);
                                 return;
                             }
@@ -576,8 +607,14 @@ async fn handle_request(
     headers: HeaderMap,
     req: Request,
 ) -> Response {
+    // Check firewall
+    if state.firewall.is_blocked(&addr.ip()) {
+        return (StatusCode::FORBIDDEN, "Blocked").into_response();
+    }
+
     // Record traffic stats
     state.traffic_stats.record_request();
+    state.firewall.record_request(addr.ip());
     
     let uri = req.uri().clone();
     let method = req.method().clone();
@@ -592,6 +629,7 @@ async fn handle_request(
     
     // Safety: prevent path traversal
     if uri_path.contains("..") {
+        state.firewall.record_traversal(addr.ip());
         return (StatusCode::FORBIDDEN, "Forbidden").into_response();
     }
 
