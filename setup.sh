@@ -186,6 +186,12 @@ RestartSec=5
 User=root
 Environment=RUST_LOG=info
 
+# File descriptor limit - critical for a reverse proxy
+LimitNOFILE=65536
+
+# OOM protection - prefer killing other processes
+OOMScoreAdjust=-500
+
 [Install]
 WantedBy=multi-user.target
 EOF

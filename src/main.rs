@@ -384,14 +384,15 @@ password = "admin"
     let mut connector = HttpConnector::new();
     connector.set_nodelay(true);           // Disable Nagle's algorithm for lower latency
     connector.enforce_http(false);          // Allow HTTPS URLs too
-    connector.set_keepalive(Some(Duration::from_secs(60))); // TCP keepalive
+    connector.set_keepalive(Some(Duration::from_secs(30))); // TCP keepalive
+    connector.set_connect_timeout(Some(Duration::from_secs(10))); // Connection timeout
     
-    // Create HTTP client for proxying with optimized settings
+    // Create HTTP client for proxying with bounded pool settings
     let http_client = HyperClient::builder(TokioExecutor::new())
-        .pool_idle_timeout(Duration::from_secs(90))      // Keep connections alive longer
-        .pool_max_idle_per_host(100)                      // More idle connections per backend
-        .retry_canceled_requests(true)                    // Retry if connection was closed
-        .set_host(false)                                  // We set Host header ourselves
+        .pool_idle_timeout(Duration::from_secs(30))       // Don't hold idle connections too long
+        .pool_max_idle_per_host(32)                        // Bounded idle connections per backend
+        .retry_canceled_requests(true)                     // Retry if connection was closed
+        .set_host(false)                                   // We set Host header ourselves
         .build(connector);
 
     let vhost_count = vhosts.len();
@@ -494,37 +495,63 @@ password = "admin"
                     let app = app_clone.clone();
                     
                     tokio::spawn(async move {
-                        match acceptor.accept(stream).await {
-                            Ok(tls_stream) => {
-                                let io = TokioIo::new(tls_stream);
-                                // Create a service that injects ConnectInfo and IsHttps marker
-                                let service = hyper::service::service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
-                                    let mut app = app.clone();
-                                    async move {
-                                        // Insert ConnectInfo and IsHttps extensions
-                                        req.extensions_mut().insert(ConnectInfo(remote_addr));
-                                        req.extensions_mut().insert(IsHttps(true));
-                                        let req = Request::from(req);
-                                        let resp = app.call(req).await.unwrap_or_else(|_| {
-                                            (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response()
-                                        });
-                                        Ok::<_, std::convert::Infallible>(resp)
-                                    }
+                        // TLS handshake timeout - 10 seconds to complete handshake
+                        let tls_stream = match tokio::time::timeout(
+                            Duration::from_secs(10),
+                            acceptor.accept(stream),
+                        ).await {
+                            Ok(Ok(s)) => s,
+                            Ok(Err(e)) => {
+                                if !is_common_connection_error(&e) {
+                                    warn!("TLS Accept Error: {}", e);
+                                }
+                                return;
+                            }
+                            Err(_) => {
+                                debug!("TLS handshake timeout from {}", remote_addr);
+                                return;
+                            }
+                        };
+
+                        let io = TokioIo::new(tls_stream);
+                        // Create a service that injects ConnectInfo and IsHttps marker
+                        let service = hyper::service::service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
+                            let mut app = app.clone();
+                            async move {
+                                // Insert ConnectInfo and IsHttps extensions
+                                req.extensions_mut().insert(ConnectInfo(remote_addr));
+                                req.extensions_mut().insert(IsHttps(true));
+                                let req = Request::from(req);
+                                let resp = app.call(req).await.unwrap_or_else(|_| {
+                                    (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response()
                                 });
-                                
-                                if let Err(err) = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
-                                    .serve_connection(io, service)
-                                    .await 
-                                {
+                                Ok::<_, std::convert::Infallible>(resp)
+                            }
+                        });
+                        
+                        // Build the connection handler with keep-alive timeouts
+                        let mut builder = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+                        let mut http1_builder = builder.http1();
+                        http1_builder
+                            .keep_alive(true)
+                            .header_read_timeout(Duration::from_secs(30))
+                            .timer(hyper_util::rt::TokioTimer::new());
+                        let conn = http1_builder.serve_connection(io, service);
+                        
+                        // Overall connection lifetime limit: 5 minutes max
+                        // This prevents keep-alive connections from leaking FDs forever
+                        tokio::pin!(conn);
+                        tokio::select! {
+                            result = &mut conn => {
+                                if let Err(err) = result {
                                     if !is_common_connection_error(err.as_ref()) {
                                         error!("Error serving connection: {:?}", err);
                                     }
                                 }
                             }
-                            Err(e) => {
-                                if !is_common_connection_error(&e) {
-                                    warn!("TLS Accept Error: {}", e);
-                                }
+                            _ = tokio::time::sleep(Duration::from_secs(300)) => {
+                                debug!("Connection from {} timed out after 5 minutes, closing", remote_addr);
+                                // Connection is dropped here, closing the socket
                             }
                         }
                     });
