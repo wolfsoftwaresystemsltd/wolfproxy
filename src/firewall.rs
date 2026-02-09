@@ -10,10 +10,11 @@ use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use dashmap::DashMap;
-use tracing::{info, warn};
+use tracing::warn;
 
 /// Reason an IP was blocked
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum BlockReason {
     TlsAbuse,           // Repeated TLS handshake failures
     PathTraversal,      // Attempted path traversal (..)
@@ -72,6 +73,7 @@ impl IpTracker {
 }
 
 /// A blocked IP entry
+#[allow(dead_code)]
 struct BlockEntry {
     reason: BlockReason,
     blocked_at: Instant,
@@ -113,9 +115,9 @@ pub struct FirewallConfig {
 fn default_enabled() -> bool { true }
 fn default_window() -> u64 { 60 }
 fn default_ban_duration() -> u64 { 600 }
-fn default_tls_threshold() -> u32 { 10 }
+fn default_tls_threshold() -> u32 { 100 }
 fn default_bad_request_threshold() -> u32 { 50 }
-fn default_rate_limit() -> u32 { 500 }
+fn default_rate_limit() -> u32 { 1000 }
 fn default_traversal_threshold() -> u32 { 3 }
 
 impl Default for FirewallConfig {
@@ -124,9 +126,9 @@ impl Default for FirewallConfig {
             enabled: true,
             window_secs: 60,
             ban_duration_secs: 600,
-            tls_failure_threshold: 10,
+            tls_failure_threshold: 100,
             bad_request_threshold: 50,
-            rate_limit: 500,
+            rate_limit: 1000,
             traversal_threshold: 3,
         }
     }
@@ -145,6 +147,7 @@ pub struct Firewall {
     pub total_denied: AtomicU64,
 }
 
+#[allow(dead_code)]
 impl Firewall {
     pub fn new(config: FirewallConfig) -> Self {
         let fw = Self {

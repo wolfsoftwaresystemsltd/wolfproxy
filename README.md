@@ -291,9 +291,9 @@ WolfProxy includes a built-in firewall that automatically detects and blocks mal
 
 | Threat | Default Threshold | Description |
 |--------|-------------------|-------------|
-| **TLS Abuse** | 10 failures / 60s | Repeated failed TLS handshakes (scanners, bots) |
+| **TLS Abuse** | 100 failures / 60s | Repeated failed TLS handshakes (scanners, bots) |
 | **Path Traversal** | 3 attempts / 60s | `../` in URLs (always malicious) |
-| **Rate Limiting** | 500 requests / 60s | Excessive request rate from single IP |
+| **Rate Limiting** | 1000 requests / 60s | Excessive request rate from single IP |
 | **Bad Requests** | 50 errors / 60s | Too many 4xx responses |
 
 Blocked IPs are banned for **10 minutes** by default. Bans expire automatically.
@@ -314,9 +314,9 @@ Add a `[firewall]` section to `wolfproxy.toml` to customize (all values are opti
 enabled = true              # Enable/disable the firewall
 window_secs = 60            # Time window for counting violations
 ban_duration_secs = 600     # Ban duration (10 minutes)
-tls_failure_threshold = 10  # TLS failures before ban
+tls_failure_threshold = 100 # TLS failures before ban
 bad_request_threshold = 50  # 4xx errors before ban
-rate_limit = 500            # Max requests per window per IP
+rate_limit = 1000            # Max requests per window per IP
 traversal_threshold = 3     # Path traversal attempts before ban
 ```
 
