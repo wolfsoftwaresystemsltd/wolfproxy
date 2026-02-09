@@ -55,18 +55,29 @@ The one-line installer performs the following steps automatically:
 ### After Installation
 
 ```bash
-# Stop nginx first (WolfProxy replaces nginx)
-sudo systemctl stop nginx && sudo systemctl disable nginx
-
-# Start WolfProxy
-sudo systemctl start wolfproxy
-
-# Enable on boot
-sudo systemctl enable wolfproxy
+# View status
+sudo systemctl status wolfproxy
 
 # View logs
 journalctl -u wolfproxy -f
 ```
+
+### Upgrading
+
+To upgrade to the latest version, simply re-run the same one-line installer:
+
+```bash
+curl -sL https://raw.githubusercontent.com/wolfsoftwaresystemsltd/wolfproxy/main/setup.sh | sudo bash
+```
+
+The installer will automatically:
+- **Back up** your `wolfproxy.toml` configuration
+- **Pull** the latest code from GitHub
+- **Restore** your configuration
+- **Rebuild** the binary
+- **Restart** the service with zero downtime
+
+Your configuration is always preserved during upgrades.
 
 ### Installation Paths
 
