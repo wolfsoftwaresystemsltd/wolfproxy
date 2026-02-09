@@ -143,11 +143,27 @@ install_rust
 INSTALL_DIR="/opt/wolfproxy"
 REPO_URL="https://github.com/wolfsoftwaresystemsltd/wolfproxy.git"
 
-if [ -d "$INSTALL_DIR" ]; then
+if [ -d "$INSTALL_DIR" ] && [ -d "$INSTALL_DIR/.git" ]; then
     info "Updating existing installation..."
     cd "$INSTALL_DIR"
     git pull
     success "Updated to latest version"
+elif [ -d "$INSTALL_DIR" ]; then
+    info "Existing non-git installation found, re-installing..."
+    # Preserve config
+    if [ -f "$INSTALL_DIR/wolfproxy.toml" ]; then
+        cp "$INSTALL_DIR/wolfproxy.toml" /tmp/wolfproxy.toml.bak
+        info "Backed up existing wolfproxy.toml"
+    fi
+    rm -rf "$INSTALL_DIR"
+    git clone "$REPO_URL" "$INSTALL_DIR"
+    # Restore config
+    if [ -f /tmp/wolfproxy.toml.bak ]; then
+        cp /tmp/wolfproxy.toml.bak "$INSTALL_DIR/wolfproxy.toml"
+        rm /tmp/wolfproxy.toml.bak
+        success "Restored existing configuration"
+    fi
+    success "Repository cloned"
 else
     info "Cloning WolfProxy repository..."
     git clone "$REPO_URL" "$INSTALL_DIR"
