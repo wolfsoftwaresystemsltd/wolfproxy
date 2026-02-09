@@ -182,13 +182,9 @@ fi
 $CARGO build --release
 success "Build complete"
 
-# Install service
-if [ -f "$INSTALL_DIR/install_service.sh" ]; then
-    info "Installing systemd service..."
-    chmod +x "$INSTALL_DIR/install_service.sh"
-    
-    # Create systemd service file directly
-    cat > /etc/systemd/system/wolfproxy.service << 'EOF'
+# Create systemd service file
+info "Installing systemd service..."
+cat > /etc/systemd/system/wolfproxy.service << 'EOF'
 [Unit]
 Description=WolfProxy - High Performance Reverse Proxy
 After=network.target
@@ -212,9 +208,8 @@ OOMScoreAdjust=-500
 WantedBy=multi-user.target
 EOF
 
-    systemctl daemon-reload
-    success "Service installed"
-fi
+systemctl daemon-reload
+success "Service installed"
 
 # Create default config if not exists
 if [ ! -f "$INSTALL_DIR/wolfproxy.toml" ]; then
@@ -237,23 +232,49 @@ EOF
     success "Default configuration created"
 fi
 
+# Stop existing services and start WolfProxy
+info "Activating WolfProxy..."
+
+# Stop wolfproxy if running
+if systemctl is-active --quiet wolfproxy 2>/dev/null; then
+    info "Stopping existing WolfProxy..."
+    systemctl stop wolfproxy
+    success "WolfProxy stopped"
+fi
+
+# Stop nginx if running (wolfproxy replaces it)
+if systemctl is-active --quiet nginx 2>/dev/null; then
+    info "Stopping nginx (WolfProxy replaces nginx)..."
+    systemctl stop nginx
+    systemctl disable nginx 2>/dev/null || true
+    success "nginx stopped and disabled"
+fi
+
+# Start WolfProxy
+systemctl enable wolfproxy 2>/dev/null || true
+systemctl start wolfproxy
+
+# Verify it started
+sleep 2
+if systemctl is-active --quiet wolfproxy; then
+    success "WolfProxy is running!"
+else
+    error "WolfProxy failed to start. Check logs: journalctl -u wolfproxy -n 50"
+fi
+
 echo ""
 echo -e "${GREEN}${BOLD}═══════════════════════════════════════════════════════════════${RESET}"
-echo -e "${GREEN}${BOLD}  WolfProxy has been installed successfully!${RESET}"
+echo -e "${GREEN}${BOLD}  WolfProxy has been installed and started successfully!${RESET}"
 echo -e "${GREEN}${BOLD}═══════════════════════════════════════════════════════════════${RESET}"
 echo ""
 echo -e "  Installation directory: ${CYAN}/opt/wolfproxy${RESET}"
 echo -e "  Configuration file:     ${CYAN}/opt/wolfproxy/wolfproxy.toml${RESET}"
 echo ""
 echo "  Commands:"
-echo -e "    Start:   ${YELLOW}sudo systemctl start wolfproxy${RESET}"
-echo -e "    Stop:    ${YELLOW}sudo systemctl stop wolfproxy${RESET}"
 echo -e "    Status:  ${YELLOW}sudo systemctl status wolfproxy${RESET}"
-echo -e "    Enable:  ${YELLOW}sudo systemctl enable wolfproxy${RESET}"
 echo -e "    Logs:    ${YELLOW}journalctl -u wolfproxy -f${RESET}"
+echo -e "    Restart: ${YELLOW}sudo systemctl restart wolfproxy${RESET}"
 echo ""
-echo -e "  ${BOLD}Before starting, stop nginx:${RESET}"
-echo -e "    ${YELLOW}sudo systemctl stop nginx && sudo systemctl disable nginx${RESET}"
-echo ""
+echo -e "  Monitoring: ${CYAN}http://your-server:5001/${RESET}"
 echo -e "  Documentation: ${CYAN}https://github.com/wolfsoftwaresystemsltd/wolfproxy${RESET}"
 echo ""
