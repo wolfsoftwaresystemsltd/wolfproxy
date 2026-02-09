@@ -245,7 +245,13 @@ fn is_common_connection_error(err: &dyn std::error::Error) -> bool {
     s.contains("ConnectionAborted") ||
     s.contains("NotConnected") ||
     s.contains("TimedOut") ||
-    s.contains("IncompleteMessage")
+    s.contains("IncompleteMessage") ||
+    // TLS noise from bots/scanners - normal on public servers
+    s.contains("no server name") ||
+    s.contains("corrupt message") ||
+    s.contains("received fatal alert") ||
+    s.contains("peer is not authenticated") ||
+    s.contains("certificate")
 }
 
 #[tokio::main]
