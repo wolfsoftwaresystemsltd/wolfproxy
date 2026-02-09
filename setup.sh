@@ -146,7 +146,18 @@ REPO_URL="https://github.com/wolfsoftwaresystemsltd/wolfproxy.git"
 if [ -d "$INSTALL_DIR" ] && [ -d "$INSTALL_DIR/.git" ]; then
     info "Updating existing installation..."
     cd "$INSTALL_DIR"
+    # Back up config before pull (git may conflict with local config)
+    if [ -f "$INSTALL_DIR/wolfproxy.toml" ]; then
+        cp "$INSTALL_DIR/wolfproxy.toml" /tmp/wolfproxy.toml.bak
+    fi
+    git checkout -- . 2>/dev/null || true
     git pull
+    # Restore config
+    if [ -f /tmp/wolfproxy.toml.bak ]; then
+        cp /tmp/wolfproxy.toml.bak "$INSTALL_DIR/wolfproxy.toml"
+        rm /tmp/wolfproxy.toml.bak
+        success "Restored existing configuration"
+    fi
     success "Updated to latest version"
 elif [ -d "$INSTALL_DIR" ]; then
     info "Existing non-git installation found, re-installing..."
