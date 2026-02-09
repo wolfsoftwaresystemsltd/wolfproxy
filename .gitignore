@@ -9,3 +9,4 @@ Cargo.lock
 
 # Local deployment script (contains server IPs)
 copyfiles
+wolfproxy.toml
