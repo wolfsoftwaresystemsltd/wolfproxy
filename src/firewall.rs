@@ -112,7 +112,7 @@ pub struct FirewallConfig {
     pub traversal_threshold: u32,
 }
 
-fn default_enabled() -> bool { true }
+fn default_enabled() -> bool { false }
 fn default_window() -> u64 { 60 }
 fn default_ban_duration() -> u64 { 600 }
 fn default_tls_threshold() -> u32 { 100 }
@@ -123,7 +123,7 @@ fn default_traversal_threshold() -> u32 { 3 }
 impl Default for FirewallConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             window_secs: 60,
             ban_duration_secs: 600,
             tls_failure_threshold: 100,
