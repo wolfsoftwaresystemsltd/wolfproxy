@@ -47,7 +47,7 @@ mod monitoring;
 mod firewall;
 
 use nginx::{NginxConfig, ServerBlock, LocationBlock, ProxyHeader, RewriteFlag, IfCondition, LoadBalanceMethod};
-use upstream::UpstreamManager;
+use upstream::{UpstreamManager, LoadBalancer, BackendServer};
 use monitoring::{MonitoringConfig, TrafficStats};
 use firewall::{Firewall, FirewallConfig};
 
@@ -953,94 +953,59 @@ async fn handle_proxy(
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| client_addr.ip().to_string());
     
-    // Parse the proxy_pass URL
-    let (backend_url, path_suffix) = if proxy_pass.starts_with("http://") || proxy_pass.starts_with("https://") {
-        // Check if this is actually an upstream reference like http://upstream_name
-        let after_scheme = if proxy_pass.starts_with("https://") {
-            &proxy_pass[8..]
-        } else {
-            &proxy_pass[7..]
-        };
-        
-        // Extract potential upstream name (before any path or port that looks like IP)
+    // Resolve proxy target — either a load-balanced upstream group or a direct URL
+    enum ProxyTarget {
+        LoadBalanced { lb: Arc<LoadBalancer>, affinity_key: Option<String> },
+        Direct { url: String },
+    }
+
+    fn affinity_key_for(lb: &LoadBalancer, php_session: Option<&str>, client_ip: &str) -> Option<String> {
+        if let Some(s) = php_session {
+            return Some(s.to_string());
+        }
+        if matches!(lb.method, LoadBalanceMethod::IpHash) {
+            return Some(client_ip.to_string());
+        }
+        None
+    }
+
+    let path_suffix = req.uri().path_and_query().map(|pq| pq.to_string()).unwrap_or_default();
+
+    let target: ProxyTarget = if proxy_pass.starts_with("http://") || proxy_pass.starts_with("https://") {
+        let after_scheme = if proxy_pass.starts_with("https://") { &proxy_pass[8..] } else { &proxy_pass[7..] };
         let potential_upstream = after_scheme.split('/').next().unwrap_or(after_scheme);
         let potential_upstream = potential_upstream.split(':').next().unwrap_or(potential_upstream);
-        
+
         debug!("Checking if '{}' is an upstream", potential_upstream);
-        
+
         if let Some(lb) = state.upstreams.get(potential_upstream) {
-            // It's an upstream reference
             debug!("Found upstream '{}' with {} servers", potential_upstream, lb.servers.len());
             upstream_name_used = Some(potential_upstream.to_string());
-            let affinity_key = php_session
-                .as_deref()
-                .or_else(|| {
-                    if matches!(lb.method, LoadBalanceMethod::IpHash) {
-                        Some(client_ip.as_str())
-                    } else {
-                        None
-                    }
-                });
-
-            if let Some(server) = lb.next_server(affinity_key) {
-                debug!("Selected backend server: {}", server.url);
-                (server.url.clone(), req.uri().path_and_query().map(|pq| pq.to_string()).unwrap_or_default())
-            } else {
-                return (StatusCode::BAD_GATEWAY, "No healthy upstream servers").into_response();
-            }
+            let affinity_key = affinity_key_for(&lb, php_session.as_deref(), &client_ip);
+            ProxyTarget::LoadBalanced { lb, affinity_key }
         } else {
-            // Direct URL
             debug!("Using direct URL: {}", proxy_pass);
-            (proxy_pass.to_string(), req.uri().path_and_query().map(|pq| pq.to_string()).unwrap_or_default())
+            ProxyTarget::Direct { url: proxy_pass.to_string() }
         }
     } else {
-        // Upstream reference without scheme
         let upstream_name = proxy_pass;
         debug!("Looking up upstream without scheme: {}", upstream_name);
-        
         if let Some(lb) = state.upstreams.get(upstream_name) {
             upstream_name_used = Some(upstream_name.to_string());
-            let affinity_key = php_session
-                .as_deref()
-                .or_else(|| {
-                    if matches!(lb.method, LoadBalanceMethod::IpHash) {
-                        Some(client_ip.as_str())
-                    } else {
-                        None
-                    }
-                });
-
-            if let Some(server) = lb.next_server(affinity_key) {
-                debug!("Selected backend server: {}", server.url);
-                (server.url.clone(), req.uri().path_and_query().map(|pq| pq.to_string()).unwrap_or_default())
-            } else {
-                return (StatusCode::BAD_GATEWAY, "No healthy upstream servers").into_response();
-            }
+            let affinity_key = affinity_key_for(&lb, php_session.as_deref(), &client_ip);
+            ProxyTarget::LoadBalanced { lb, affinity_key }
         } else {
-            // Not an upstream, treat as direct URL
             debug!("Not found as upstream, treating as direct: http://{}", upstream_name);
-            (format!("http://{}", upstream_name), req.uri().path_and_query().map(|pq| pq.to_string()).unwrap_or_default())
+            ProxyTarget::Direct { url: format!("http://{}", upstream_name) }
         }
     };
-    
+
     // Record upstream request for monitoring
     if let Some(ref name) = upstream_name_used {
         state.traffic_stats.record_upstream_request(name);
     }
-    
-    // Build the proxy URL
-    let proxy_url = format!("{}{}", backend_url.trim_end_matches('/'), path_suffix);
-    debug!("Final proxy URL: {}", proxy_url);
-    
-    let uri: Uri = match proxy_url.parse() {
-        Ok(u) => u,
-        Err(e) => {
-            error!("Invalid proxy URL {}: {}", proxy_url, e);
-            return (StatusCode::BAD_GATEWAY, "Invalid upstream URL").into_response();
-        }
-    };
-    
-    // Read the request body
+
+    // Read the request body once — Bytes is Arc-shared, so retries reuse it cheaply
     let method = req.method().clone();
     let original_uri = req.uri().clone();
     let (_parts, body) = req.into_parts();
@@ -1051,133 +1016,181 @@ async fn handle_proxy(
             return (StatusCode::BAD_REQUEST, "Failed to read request body").into_response();
         }
     };
-    
-    // Build proxy request - use HTTP/1.1 like nginx does
-    let mut proxy_req = hyper::Request::builder()
-        .method(method.clone())
-        .uri(&uri)
-        .version(hyper::Version::HTTP_11);
-    
-    // Copy headers
-    for (name, value) in headers.iter() {
-        // Skip hop-by-hop headers and content-length (hyper will calculate from body)
-        let name_str = name.as_str().to_lowercase();
-        if name_str == "host" || name_str == "connection" || name_str == "keep-alive" ||
-           name_str == "transfer-encoding" || name_str == "te" || name_str == "trailer" ||
-           name_str == "upgrade" || name_str == "proxy-authorization" || name_str == "proxy-connection" ||
-           name_str == "content-length" {
-            continue;
+
+    // Cap retries at 3 (1 initial + 2 retries) to bound worst-case latency when many backends are down
+    let max_attempts: usize = match &target {
+        ProxyTarget::LoadBalanced { lb, .. } => (lb.servers.len() + lb.backup_servers.len()).clamp(1, 3),
+        ProxyTarget::Direct { .. } => 1,
+    };
+
+    let mut tried_urls: Vec<String> = Vec::new();
+    let mut last_error: Option<(StatusCode, String)> = None;
+
+    let response = loop {
+        // Pick a backend for this attempt
+        let (backend_url, backend_opt): (String, Option<BackendServer>) = match &target {
+            ProxyTarget::LoadBalanced { lb, affinity_key } => {
+                match lb.next_server(affinity_key.as_deref(), &tried_urls) {
+                    Some(s) => {
+                        debug!("Selected backend server: {} (attempt {})", s.url, tried_urls.len() + 1);
+                        (s.url.clone(), Some(s))
+                    }
+                    None => {
+                        // No remaining healthy backends — return the most recent error if any
+                        if let Some((status, msg)) = last_error {
+                            error!("Proxy request failed after {} attempt(s): {} : no remaining healthy upstreams: {}", tried_urls.len(), original_uri, msg);
+                            return (status, msg).into_response();
+                        }
+                        return (StatusCode::BAD_GATEWAY, "No healthy upstream servers").into_response();
+                    }
+                }
+            }
+            ProxyTarget::Direct { url } => (url.clone(), None),
+        };
+
+        tried_urls.push(backend_url.clone());
+
+        let proxy_url = format!("{}{}", backend_url.trim_end_matches('/'), path_suffix);
+        debug!("Final proxy URL: {}", proxy_url);
+
+        let uri: Uri = match proxy_url.parse() {
+            Ok(u) => u,
+            Err(e) => {
+                error!("Invalid proxy URL {}: {}", proxy_url, e);
+                return (StatusCode::BAD_GATEWAY, "Invalid upstream URL").into_response();
+            }
+        };
+
+        // Build proxy request — HTTP/1.1 like nginx
+        let mut proxy_req_builder = hyper::Request::builder()
+            .method(method.clone())
+            .uri(&uri)
+            .version(hyper::Version::HTTP_11);
+
+        for (name, value) in headers.iter() {
+            let name_str = name.as_str().to_lowercase();
+            if name_str == "host" || name_str == "connection" || name_str == "keep-alive" ||
+               name_str == "transfer-encoding" || name_str == "te" || name_str == "trailer" ||
+               name_str == "upgrade" || name_str == "proxy-authorization" || name_str == "proxy-connection" ||
+               name_str == "content-length" {
+                continue;
+            }
+            proxy_req_builder = proxy_req_builder.header(name, value);
         }
-        proxy_req = proxy_req.header(name, value);
-    }
-    
-    // Collect proxy_set_header directives - these override default headers
-    let mut custom_headers: HashMap<String, String> = HashMap::new();
-    
-    // Apply proxy_set_header directives from location first
-    for ph in &location.proxy_headers {
-        let value = expand_proxy_header_value(&ph.value, &headers, client_addr, is_https);
-        custom_headers.insert(ph.name.to_lowercase(), value);
-    }
-    
-    // Apply server-level proxy headers (location overrides server)
-    for ph in server_headers {
-        let key = ph.name.to_lowercase();
-        if !custom_headers.contains_key(&key) {
+
+        let mut custom_headers: HashMap<String, String> = HashMap::new();
+        for ph in &location.proxy_headers {
             let value = expand_proxy_header_value(&ph.value, &headers, client_addr, is_https);
-            custom_headers.insert(key, value);
+            custom_headers.insert(ph.name.to_lowercase(), value);
         }
-    }
-    
-    // If no custom Host header is set, default to backend host
-    if !custom_headers.contains_key("host") {
-        if let Some(host) = uri.host() {
-            let host_header = if let Some(port) = uri.port() {
-                format!("{}:{}", host, port)
-            } else {
-                host.to_string()
-            };
-            custom_headers.insert("host".to_string(), host_header);
-        }
-    }
-    
-    // Apply custom headers - skip empty values (nginx uses "" to mean "don't send this header")
-    for (name, value) in &custom_headers {
-        if value.is_empty() {
-            // Empty value means don't send this header - skip it
-            continue;
-        }
-        if let Ok(hv) = HeaderValue::from_str(value) {
-            if let Ok(hn) = HeaderName::from_str(name) {
-                proxy_req = proxy_req.header(hn, hv);
+        for ph in server_headers {
+            let key = ph.name.to_lowercase();
+            if !custom_headers.contains_key(&key) {
+                let value = expand_proxy_header_value(&ph.value, &headers, client_addr, is_https);
+                custom_headers.insert(key, value);
             }
         }
-    }
-    
-    let proxy_req = match proxy_req.body(Full::new(body_bytes)) {
-        Ok(r) => r,
-        Err(e) => {
-            error!("Failed to build proxy request: {}", e);
-            return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to build proxy request").into_response();
+        if !custom_headers.contains_key("host") {
+            if let Some(host) = uri.host() {
+                let host_header = if let Some(port) = uri.port() {
+                    format!("{}:{}", host, port)
+                } else {
+                    host.to_string()
+                };
+                custom_headers.insert("host".to_string(), host_header);
+            }
         }
-    };
-    
-    // Send the request
-    debug!("Proxying {} {} -> {}", method, original_uri, uri);
-    
-    let backend_host = uri.host().unwrap_or("unknown");
-    let backend_port = uri.port_u16().unwrap_or(80);
-    let backend_addr = format!("{}:{}", backend_host, backend_port);
-    
-    let response = match state.http_client.request(proxy_req).await {
-        Ok(r) => r,
-        Err(e) => {
-            // Provide detailed error information for troubleshooting
-            let error_details = format!("{:?}", e);
-            let error_lower = error_details.to_lowercase();
-            
-            let (status, message) = if error_lower.contains("connecterror") || error_lower.contains("connect") {
-                // Connection refused, network unreachable, etc.
-                if error_lower.contains("refused") {
+        for (name, value) in &custom_headers {
+            if value.is_empty() {
+                continue;
+            }
+            if let Ok(hv) = HeaderValue::from_str(value) {
+                if let Ok(hn) = HeaderName::from_str(name) {
+                    proxy_req_builder = proxy_req_builder.header(hn, hv);
+                }
+            }
+        }
+
+        let proxy_req = match proxy_req_builder.body(Full::new(body_bytes.clone())) {
+            Ok(r) => r,
+            Err(e) => {
+                error!("Failed to build proxy request: {}", e);
+                return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to build proxy request").into_response();
+            }
+        };
+
+        let backend_host = uri.host().unwrap_or("unknown").to_string();
+        let backend_port = uri.port_u16().unwrap_or(80);
+        let backend_addr = format!("{}:{}", backend_host, backend_port);
+
+        debug!("Proxying {} {} -> {}", method, original_uri, uri);
+
+        match state.http_client.request(proxy_req).await {
+            Ok(r) => {
+                if let Some(ref b) = backend_opt {
+                    b.record_success();
+                }
+                break r;
+            }
+            Err(e) => {
+                // Connection-class failure — mark this backend down and try another
+                if let Some(ref b) = backend_opt {
+                    b.record_failure();
+                }
+
+                let error_details = format!("{:?}", e);
+                let error_lower = error_details.to_lowercase();
+
+                let (status, message) = if error_lower.contains("connecterror") || error_lower.contains("connect") {
+                    if error_lower.contains("refused") {
+                        (StatusCode::BAD_GATEWAY, format!(
+                            "Connection refused to backend {} - check if the service is running on that port",
+                            backend_addr
+                        ))
+                    } else if error_lower.contains("unreachable") || error_lower.contains("no route") {
+                        (StatusCode::BAD_GATEWAY, format!(
+                            "Network unreachable to backend {} - check network/firewall configuration",
+                            backend_addr
+                        ))
+                    } else {
+                        (StatusCode::BAD_GATEWAY, format!(
+                            "Cannot connect to backend {} - verify the server is reachable and port is open",
+                            backend_addr
+                        ))
+                    }
+                } else if error_lower.contains("dns") || error_lower.contains("resolve") || error_lower.contains("lookup") {
                     (StatusCode::BAD_GATEWAY, format!(
-                        "Connection refused to backend {} - check if the service is running on that port", 
+                        "DNS resolution failed for '{}' - check hostname or use IP address",
+                        backend_host
+                    ))
+                } else if error_lower.contains("timeout") || error_lower.contains("timedout") {
+                    (StatusCode::GATEWAY_TIMEOUT, format!(
+                        "Connection timeout to backend {} - server may be overloaded or unreachable",
                         backend_addr
                     ))
-                } else if error_lower.contains("unreachable") || error_lower.contains("no route") {
+                } else if error_lower.contains("reset") {
                     (StatusCode::BAD_GATEWAY, format!(
-                        "Network unreachable to backend {} - check network/firewall configuration", 
+                        "Connection reset by backend {} - service may have crashed or rejected the connection",
                         backend_addr
                     ))
                 } else {
                     (StatusCode::BAD_GATEWAY, format!(
-                        "Cannot connect to backend {} - verify the server is reachable and port is open", 
-                        backend_addr
+                        "Upstream error connecting to {}: {}",
+                        backend_addr, e
                     ))
+                };
+
+                let can_retry = matches!(target, ProxyTarget::LoadBalanced { .. }) && tried_urls.len() < max_attempts;
+                if can_retry {
+                    warn!("Backend {} failed (attempt {}/{}), retrying on next upstream: {} (raw: {})",
+                          backend_addr, tried_urls.len(), max_attempts, message, error_details);
+                    last_error = Some((status, message));
+                    continue;
                 }
-            } else if error_lower.contains("dns") || error_lower.contains("resolve") || error_lower.contains("lookup") {
-                (StatusCode::BAD_GATEWAY, format!(
-                    "DNS resolution failed for '{}' - check hostname or use IP address", 
-                    backend_host
-                ))
-            } else if error_lower.contains("timeout") || error_lower.contains("timedout") {
-                (StatusCode::GATEWAY_TIMEOUT, format!(
-                    "Connection timeout to backend {} - server may be overloaded or unreachable", 
-                    backend_addr
-                ))
-            } else if error_lower.contains("reset") {
-                (StatusCode::BAD_GATEWAY, format!(
-                    "Connection reset by backend {} - service may have crashed or rejected the connection", 
-                    backend_addr
-                ))
-            } else {
-                (StatusCode::BAD_GATEWAY, format!(
-                    "Upstream error connecting to {}: {}", 
-                    backend_addr, e
-                ))
-            };
-            
-            error!("Proxy request failed: {} -> {} : {} (raw: {})", original_uri, backend_addr, message, error_details);
-            return (status, message).into_response();
+
+                error!("Proxy request failed: {} -> {} : {} (raw: {})", original_uri, backend_addr, message, error_details);
+                return (status, message).into_response();
+            }
         }
     };
     

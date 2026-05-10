@@ -33,7 +33,7 @@ impl Default for UpstreamServer {
             port: 80,
             weight: 1,
             max_fails: 1,
-            fail_timeout: 10,
+            fail_timeout: 300,
             backup: false,
             down: false,
         }
@@ -401,7 +401,7 @@ fn parse_upstream_server(line: &str) -> Option<UpstreamServer> {
             server.max_fails = part[10..].parse().unwrap_or(1);
         } else if part.starts_with("fail_timeout=") {
             let timeout_str = part[13..].trim_end_matches('s');
-            server.fail_timeout = timeout_str.parse().unwrap_or(10);
+            server.fail_timeout = timeout_str.parse().unwrap_or(300);
         } else if part == "backup" {
             server.backup = true;
         } else if part == "down" {

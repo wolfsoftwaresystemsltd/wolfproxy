@@ -2,7 +2,7 @@
 //! Handles load balancing across multiple backend servers
 
 use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -15,16 +15,13 @@ use crate::nginx::{Upstream, UpstreamServer, LoadBalanceMethod};
 
 
 /// Health status of a backend server
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct ServerHealth {
-    /// Is the server healthy?
-    pub healthy: bool,
-    /// Number of consecutive failures
+    /// Number of consecutive failures since last success
     pub failures: AtomicUsize,
-    /// Last failure time
-    pub last_failure: Option<Instant>,
-    /// Total requests served
+    /// Time of the most recent failure (None if no failure recorded or already cleared)
+    pub last_failure: Mutex<Option<Instant>>,
+    /// Total requests served successfully
     pub total_requests: AtomicU64,
     /// Active connections
     pub active_connections: AtomicUsize,
@@ -33,9 +30,8 @@ pub struct ServerHealth {
 impl Default for ServerHealth {
     fn default() -> Self {
         Self {
-            healthy: true,
             failures: AtomicUsize::new(0),
-            last_failure: None,
+            last_failure: Mutex::new(None),
             total_requests: AtomicU64::new(0),
             active_connections: AtomicUsize::new(0),
         }
@@ -72,34 +68,34 @@ impl BackendServer {
         if self.config.down {
             return false;
         }
-        
-        // Check if we've exceeded max_fails
+
         let failures = self.health.failures.load(Ordering::Relaxed);
         if failures >= self.config.max_fails as usize {
-            // Check if fail_timeout has elapsed
-            if let Some(last_failure) = self.health.last_failure {
+            let mut guard = self.health.last_failure.lock().unwrap();
+            if let Some(last_failure) = *guard {
                 if last_failure.elapsed() < Duration::from_secs(self.config.fail_timeout) {
                     return false;
                 }
-                // Reset failures after timeout
+                // fail_timeout elapsed — give the server another chance
+                *guard = None;
                 self.health.failures.store(0, Ordering::Relaxed);
             }
         }
-        
+
         true
     }
-    
-    /// Record a successful request
-    #[allow(dead_code)]
+
+    /// Record a successful request — clears the failure state
     pub fn record_success(&self) {
         self.health.failures.store(0, Ordering::Relaxed);
+        *self.health.last_failure.lock().unwrap() = None;
         self.health.total_requests.fetch_add(1, Ordering::Relaxed);
     }
-    
-    /// Record a failed request
-    #[allow(dead_code)]
+
+    /// Record a failed request — increments failure count and stamps the time
     pub fn record_failure(&self) {
         self.health.failures.fetch_add(1, Ordering::Relaxed);
+        *self.health.last_failure.lock().unwrap() = Some(Instant::now());
     }
     
     /// Increment active connections
@@ -155,24 +151,22 @@ impl LoadBalancer {
         }
     }
     
-    /// Get the next available backend server
-    pub fn next_server(&self, affinity_key: Option<&str>) -> Option<&BackendServer> {
-        // Try primary servers first
-        if let Some(server) = self.select_server(&self.servers, affinity_key) {
+    /// Get the next available backend server. Backends whose `url` is in
+    /// `excluded_urls` are skipped — used for retrying within a single request.
+    pub fn next_server(&self, affinity_key: Option<&str>, excluded_urls: &[String]) -> Option<BackendServer> {
+        if let Some(server) = self.select_server(&self.servers, affinity_key, excluded_urls) {
             return Some(server);
         }
-        
-        // Fall back to backup servers
-        self.select_server(&self.backup_servers, affinity_key)
+        self.select_server(&self.backup_servers, affinity_key, excluded_urls)
     }
-    
-    fn select_server<'a>(&'a self, servers: &'a [BackendServer], affinity_key: Option<&str>) -> Option<&'a BackendServer> {
+
+    fn select_server(&self, servers: &[BackendServer], affinity_key: Option<&str>, excluded_urls: &[String]) -> Option<BackendServer> {
         let available: Vec<usize> = servers.iter()
             .enumerate()
-            .filter(|(_, s)| s.is_available())
+            .filter(|(_, s)| s.is_available() && !excluded_urls.iter().any(|u| u == &s.url))
             .map(|(i, _)| i)
             .collect();
-        
+
         if available.is_empty() {
             return None;
         }
@@ -180,10 +174,10 @@ impl LoadBalancer {
         // If we have an affinity key (e.g., PHPSESSID), pin to the hashed server when healthy
         if let Some(key) = affinity_key {
             if let Some(server) = self.sticky_by_key(servers, &available, key) {
-                return Some(server);
+                return Some(server.clone());
             }
         }
-        
+
         let index = match &self.method {
             LoadBalanceMethod::RoundRobin => {
                 self.round_robin(&available)
@@ -202,8 +196,8 @@ impl LoadBalancer {
                 self.random(&available)
             }
         };
-        
-        servers.get(index)
+
+        servers.get(index).cloned()
     }
     
     fn round_robin(&self, available: &[usize]) -> usize {
@@ -397,9 +391,9 @@ mod tests {
         let upstream = make_upstream();
         let lb = LoadBalancer::new(&upstream);
         
-        let s1 = lb.next_server(None).unwrap();
-        let s2 = lb.next_server(None).unwrap();
-        let s3 = lb.next_server(None).unwrap();
+        let s1 = lb.next_server(None, &[]).unwrap();
+        let s2 = lb.next_server(None, &[]).unwrap();
+        let s3 = lb.next_server(None, &[]).unwrap();
         
         // Should cycle through servers
         assert_ne!(s1.config.address, s2.config.address);
@@ -413,8 +407,8 @@ mod tests {
         let lb = LoadBalancer::new(&upstream);
         
         // Same IP should always get same server
-        let s1 = lb.next_server(Some("192.168.1.1")).unwrap();
-        let s2 = lb.next_server(Some("192.168.1.1")).unwrap();
+        let s1 = lb.next_server(Some("192.168.1.1"), &[]).unwrap();
+        let s2 = lb.next_server(Some("192.168.1.1"), &[]).unwrap();
         
         assert_eq!(s1.config.address, s2.config.address);
     }
@@ -425,8 +419,8 @@ mod tests {
         let lb = LoadBalancer::new(&upstream);
 
         // Same session id should stick to the same backend
-        let s1 = lb.next_server(Some("php-session-123")).unwrap();
-        let s2 = lb.next_server(Some("php-session-123")).unwrap();
+        let s1 = lb.next_server(Some("php-session-123"), &[]).unwrap();
+        let s2 = lb.next_server(Some("php-session-123"), &[]).unwrap();
         assert_eq!(s1.config.address, s2.config.address);
     }
 }
