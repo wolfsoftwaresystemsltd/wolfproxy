@@ -93,8 +93,11 @@ SUMS_URL="https://github.com/${REPO}/releases/latest/download/SHA256SUMS"
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
 
+# Download to the arch-suffixed name so sha256sum -c can resolve the
+# filename it reads out of SHA256SUMS directly (the workflow emits
+# lines like "<hash>  wolfproxy-x86_64").
 info "Downloading wolfproxy-${ARCH}…"
-if ! curl -fsSL -o "$TMPDIR/wolfproxy" "$ASSET_URL"; then
+if ! curl -fsSL -o "$TMPDIR/wolfproxy-${ARCH}" "$ASSET_URL"; then
     error "Download failed: $ASSET_URL — check network access and that the release exists."
 fi
 
@@ -104,7 +107,12 @@ fi
 info "Verifying SHA-256 checksum…"
 if curl -fsSL -o "$TMPDIR/SHA256SUMS" "$SUMS_URL"; then
     cd "$TMPDIR"
-    if grep " wolfproxy-${ARCH}$" SHA256SUMS | sha256sum -c - >/dev/null 2>&1; then
+    # sha256sum's canonical format is "<hash><two spaces><filename>" —
+    # use a fixed-string grep with the exact filename so weird hash
+    # collisions or extra files in SHA256SUMS can't slip past. Then
+    # feed only that one line into `sha256sum -c`, which resolves the
+    # filename relative to cwd (hence the cd above).
+    if grep -F "  wolfproxy-${ARCH}" SHA256SUMS | sha256sum -c - >/dev/null 2>&1; then
         success "Checksum verified."
     else
         error "Checksum mismatch — the download may be corrupted or tampered with. Refusing to install."
@@ -115,7 +123,7 @@ else
 fi
 
 # Install the binary.
-install -m 755 "$TMPDIR/wolfproxy" "$BIN_PATH"
+install -m 755 "$TMPDIR/wolfproxy-${ARCH}" "$BIN_PATH"
 mkdir -p "$INSTALL_DIR"
 # Maintain a stable path symlink so old documentation and scripts
 # pointing at /opt/wolfproxy/target/release/wolfproxy still work after
