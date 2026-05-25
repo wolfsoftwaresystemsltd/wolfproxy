@@ -134,6 +134,7 @@ fn load_ssl_keys(cert_path: &Path, key_path: &Path) -> anyhow::Result<CertifiedK
 #[derive(Debug, Clone, Deserialize)]
 struct Config {
     server: ServerConfig,
+    #[serde(default)]
     nginx: NginxConfigSettings,
     #[serde(default)]
     monitoring: MonitoringConfig,
@@ -300,7 +301,14 @@ password = "admin"
         }
     };
 
-    let config: Config = toml::from_str(&config_str).expect("Failed to parse wolfproxy.toml");
+    let config: Config = match toml::from_str(&config_str) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to parse wolfproxy.toml: {e}");
+            eprintln!("Hint: ensure the file contains at minimum a [server] section with `host = \"0.0.0.0\"`. The [nginx], [monitoring], and [firewall] sections are optional and will use defaults if omitted.");
+            std::process::exit(1);
+        }
+    };
     
     info!("Loading nginx configuration from {}", config.nginx.config_dir);
     
