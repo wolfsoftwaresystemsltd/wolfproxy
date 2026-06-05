@@ -16,6 +16,7 @@ use axum::{
 use tower::Service;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::fs::File;
@@ -473,14 +474,27 @@ password = "admin"
         http_ports.push(config.server.http_port);
     }
 
+    // Count listeners that actually bind, so we can exit non-zero if NONE do
+    // (every configured port in use — typically another wolfproxy still
+    // running). Otherwise all listener tasks just end, main() returns, and the
+    // process exits 0 — systemd then logs a hard "Address in use" failure as
+    // "status=0/SUCCESS", which is exactly what masked klasSponsor's orphan.
+    let bind_count = Arc::new(AtomicUsize::new(0));
+
     // Start HTTP Listeners
     for port in http_ports {
         let addr: SocketAddr = format!("{}:{}", host_ip, port).parse().unwrap();
         let app_clone = app.clone();
+        let bind_count = bind_count.clone();
         tasks.push(tokio::spawn(async move {
-            info!("WolfProxy HTTP listening on {}", addr);
+            // Log "listening" only AFTER the bind succeeds — the old code logged
+            // it before binding, so the journal showed "listening on :80"
+            // immediately followed by "Failed to bind :80", which read as a
+            // contradiction.
             match tokio::net::TcpListener::bind(&addr).await {
                 Ok(listener) => {
+                    bind_count.fetch_add(1, Ordering::SeqCst);
+                    info!("WolfProxy HTTP listening on {}", addr);
                     if let Err(e) = axum::serve(listener, app_clone.into_make_service_with_connect_info::<SocketAddr>()).await {
                         error!("HTTP server error on {}: {}", addr, e);
                     }
@@ -507,12 +521,17 @@ password = "admin"
             let app_clone = app.clone();
             let tls_config_clone = tls_config.clone();
             let state_clone = state.clone();
-            
+            let bind_count = bind_count.clone();
+
             tasks.push(tokio::spawn(async move {
-                info!("WolfProxy HTTPS listening on {}", addr);
                 let tls_acceptor = TlsAcceptor::from(tls_config_clone);
+                // Log "listening" only AFTER a successful bind (see HTTP note).
                 let listener = match tokio::net::TcpListener::bind(&addr).await {
-                    Ok(l) => l,
+                    Ok(l) => {
+                        bind_count.fetch_add(1, Ordering::SeqCst);
+                        info!("WolfProxy HTTPS listening on {}", addr);
+                        l
+                    }
                     Err(e) => {
                         error!("Failed to bind HTTPS to {}: {} (try running with sudo or use ports > 1024)", addr, e);
                         return;
@@ -603,6 +622,19 @@ password = "admin"
                 }
             }));
         }
+    }
+
+    // Give the listener tasks a moment to attempt their binds, then verify at
+    // least one came up. If none did, every configured port is in use (almost
+    // always another wolfproxy already holding them) — fail loudly with a
+    // non-zero exit so systemd reports the failure (and its Restart kicks in,
+    // after the unit's ExecStartPre reaps the stray) instead of logging
+    // "status=0/SUCCESS" for a proxy that never actually served.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    if bind_count.load(Ordering::SeqCst) == 0 {
+        error!("No listeners could bind — every configured port is in use. \
+                Is another wolfproxy already running? Exiting.");
+        std::process::exit(1);
     }
 
     join_all(tasks).await;

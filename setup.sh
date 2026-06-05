@@ -168,6 +168,13 @@ After=network.target
 
 [Service]
 Type=simple
+# Reap any orphaned wolfproxy still holding :80/:443/:5001 before starting.
+# wolfproxy is a single process, but a manually-started or previously-detached
+# instance living outside this unit's cgroup keeps the ports, and systemctl
+# can't reap what it never tracked — so the new instance fails to bind with
+# "Address in use" and never comes up. Clearing strays on every (re)start makes
+# the service self-heal. The leading '-' means a no-op pkill is not a failure.
+ExecStartPre=-/bin/sh -c 'pkill -x wolfproxy 2>/dev/null; sleep 1'
 ExecStart=${BIN_PATH}
 WorkingDirectory=${INSTALL_DIR}
 Restart=always
