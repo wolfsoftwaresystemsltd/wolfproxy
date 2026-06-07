@@ -261,8 +261,101 @@ fn is_common_connection_error(err: &dyn std::error::Error) -> bool {
     s.contains("certificate")
 }
 
+/// Print CLI usage. Operators mostly reach this via `--help` or a typo.
+fn print_usage(prog: &str) {
+    println!(
+        "WolfProxy {ver} — high-performance reverse proxy (nginx-config compatible)\n\n\
+         USAGE:\n    {prog} [OPTIONS]\n\n\
+         OPTIONS:\n\
+         \x20   -c, --config <PATH>  Path to wolfproxy.toml (default: ./wolfproxy.toml)\n\
+         \x20   -t, --test           Validate config + nginx sites and exit; never binds a port\n\
+         \x20   -V, --version        Print version and exit\n\
+         \x20   -h, --help           Print this help and exit\n\n\
+         With no options WolfProxy loads its config and serves traffic.",
+        ver = env!("CARGO_PKG_VERSION"),
+        prog = prog,
+    );
+}
+
+/// Validate configuration WITHOUT binding any port. Loads the TOML and the
+/// nginx site files exactly as the serve path does, prints a one-line summary
+/// or the precise parse error, and returns a process exit code (0 = valid,
+/// 1 = invalid). Backs `wolfproxy --test`; WolfStack runs it before reloading
+/// so a broken config can't take the proxy down — and, critically, it must NOT
+/// start a server (doing so used to orphan a listener on :80 and wedge the
+/// next `systemctl start` with "Address in use").
+async fn run_config_test(config_path: &str) -> i32 {
+    let config_str = match fs::read_to_string(config_path).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("wolfproxy: config test FAILED — cannot read '{config_path}': {e}");
+            return 1;
+        }
+    };
+    let config: Config = match toml::from_str(&config_str) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("wolfproxy: config test FAILED — '{config_path}' is not valid TOML: {e}");
+            return 1;
+        }
+    };
+    let nginx_config = nginx::load_nginx_sites(Path::new(&config.nginx.config_dir));
+    println!(
+        "wolfproxy: configuration OK — {} server block(s), {} upstream(s) from {}",
+        nginx_config.servers.len(),
+        nginx_config.upstreams.len(),
+        config.nginx.config_dir,
+    );
+    0
+}
+
 #[tokio::main]
 async fn main() {
+    // Parse CLI args BEFORE the banner, before tracing, and crucially before
+    // binding any port. WolfStack runs `wolfproxy --version` (install
+    // detection) and `wolfproxy --test` (config validation); these MUST exit
+    // without serving. Until v0.4.7 wolfproxy ignored argv entirely, so each
+    // probe started a full proxy that bound :80/:443 — when one ran while the
+    // systemd instance was down it orphaned a listener on the port and the
+    // next `systemctl start` failed with "Address in use" (klasSponsor 2026-06).
+    let args: Vec<String> = std::env::args().collect();
+    let mut config_path = "wolfproxy.toml".to_string();
+    let mut test_only = false;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--version" | "-V" => {
+                println!("wolfproxy {}", env!("CARGO_PKG_VERSION"));
+                return;
+            }
+            "--help" | "-h" => {
+                print_usage(&args[0]);
+                return;
+            }
+            "--test" | "-t" => test_only = true,
+            "--config" | "-c" => {
+                i += 1;
+                match args.get(i) {
+                    Some(p) => config_path = p.clone(),
+                    None => {
+                        eprintln!("error: --config requires a path argument");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            other => {
+                eprintln!("error: unknown argument '{other}'");
+                print_usage(&args[0]);
+                std::process::exit(2);
+            }
+        }
+        i += 1;
+    }
+
+    if test_only {
+        std::process::exit(run_config_test(&config_path).await);
+    }
+
     println!(r#"
  __          ______  _      ______ _____  _____   ______   ____     __
  \ \        / / __ \| |    |  ____|  __ \|  __ \ / __ \ \ / /\ \   / /
@@ -278,10 +371,10 @@ async fn main() {
     tracing_subscriber::fmt::init();
 
     // Load configuration
-    let config_str = match fs::read_to_string("wolfproxy.toml").await {
+    let config_str = match fs::read_to_string(&config_path).await {
         Ok(s) => s,
         Err(_) => {
-            eprintln!("Configuration file 'wolfproxy.toml' not found. Creating default.");
+            eprintln!("Configuration file '{config_path}' not found. Creating default.");
             let default_config = r#"[server]
 host = "0.0.0.0"
 http_port = 80
@@ -297,7 +390,7 @@ port = 5001
 username = "admin"
 password = "admin"
 "#;
-            fs::write("wolfproxy.toml", default_config).await.unwrap();
+            fs::write(&config_path, default_config).await.unwrap();
             default_config.to_string()
         }
     };
