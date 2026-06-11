@@ -33,7 +33,7 @@ jobs:
 
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -57,7 +57,7 @@ jobs:
           chmod +x dist/wolfproxy-${{ matrix.arch }}
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: wolfproxy-${{ matrix.arch }}
           path: dist/wolfproxy-${{ matrix.arch }}
@@ -70,7 +70,7 @@ jobs:
       id-token: write       # cosign keyless OIDC + attest provenance
       attestations: write   # actions/attest-build-provenance
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -79,7 +79,7 @@ jobs:
         run: echo "version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*\"\(.*\)\".*/\1/')" >> "$GITHUB_OUTPUT"
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           path: dist
           merge-multiple: true
@@ -90,7 +90,7 @@ jobs:
           sha256sum wolfproxy-x86_64 wolfproxy-aarch64 > SHA256SUMS
 
       - name: Generate build-provenance attestation
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v3
         with:
           subject-path: |
             dist/wolfproxy-x86_64
