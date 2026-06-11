@@ -238,7 +238,7 @@ struct AppState {
     default_vhosts: HashMap<u16, VirtualHost>,
     upstreams: UpstreamManager,
     upstreams_arc: Arc<UpstreamManager>,
-    http_client: HyperClient<hyper_util::client::legacy::connect::HttpConnector, Full<Bytes>>,
+    http_client: HyperClient<hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>, Full<Bytes>>,
     traffic_stats: Arc<TrafficStats>,
     firewall: Arc<Firewall>,
 }
@@ -307,6 +307,58 @@ async fn run_config_test(config_path: &str) -> i32 {
         config.nginx.config_dir,
     );
     0
+}
+
+/// Upstream cert verifier that accepts ANY certificate — the nginx
+/// `proxy_ssl_verify off` default this proxy replaces. The upstreams in a
+/// WolfStack deployment (WolfStack :8553, Proxmox :8006, PBS :8007) all
+/// serve self-signed certs, so chain verification would reject every one.
+/// Signatures are still verified against the presented cert, so the TLS
+/// session itself is sound — only the trust chain is skipped.
+#[derive(Debug)]
+struct AcceptAnyUpstreamCert;
+
+impl rustls::client::danger::ServerCertVerifier for AcceptAnyUpstreamCert {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message, cert, dss,
+            &rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message, cert, dss,
+            &rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
 }
 
 #[tokio::main]
@@ -500,13 +552,28 @@ password = "admin"
     connector.set_keepalive(Some(Duration::from_secs(30))); // TCP keepalive
     connector.set_connect_timeout(Some(Duration::from_secs(10))); // Connection timeout
     
+    // Upstream TLS: nginx-parity defaults for the homelab fleet this
+    // proxies — proxy_ssl_verify off (WolfStack/Proxmox/PBS all serve
+    // self-signed certs; verification would fail every one of them) and
+    // SNI on (hyper-rustls sends the URI host as SNI automatically).
+    // https_or_http keeps plain http:// upstreams on the same client.
+    let upstream_tls = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(AcceptAnyUpstreamCert))
+        .with_no_client_auth();
+    let https_connector = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_tls_config(upstream_tls)
+        .https_or_http()
+        .enable_http1()
+        .wrap_connector(connector);
+
     // Create HTTP client for proxying with bounded pool settings
     let http_client = HyperClient::builder(TokioExecutor::new())
         .pool_idle_timeout(Duration::from_secs(30))       // Don't hold idle connections too long
         .pool_max_idle_per_host(32)                        // Bounded idle connections per backend
         .retry_canceled_requests(true)                     // Retry if connection was closed
         .set_host(false)                                   // We set Host header ourselves
-        .build(connector);
+        .build(https_connector);
 
     let vhost_count = vhosts.len();
     let server_blocks = nginx_config.servers.len();

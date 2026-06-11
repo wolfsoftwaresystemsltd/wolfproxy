@@ -1,6 +1,6 @@
 [package]
 name = "wolfproxy"
-version = "0.4.7"
+version = "0.4.8"
 edition = "2021"
 description = "A Rust-based nginx proxy replacement that reads nginx configuration files"
 authors = ["Wolf Software Systems Ltd"]
@@ -24,6 +24,10 @@ tower-http = { version = "0.5", features = ["fs", "trace", "cors", "compression-
 # HTTP client for proxying
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1.19", features = ["full", "client-legacy"] }
+# TLS for UPSTREAM connections (proxy_pass https://…). The server side
+# already terminates TLS; without this the upstream client was plain
+# HttpConnector and every https:// backend got a cleartext hello -> reset.
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "aws-lc-rs", "tls12", "logging"] }
 http-body-util = "0.1"
 
 # Serialization
