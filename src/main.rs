@@ -760,7 +760,11 @@ password = "admin"
                             .keep_alive(true)
                             .header_read_timeout(Duration::from_secs(30))
                             .timer(hyper_util::rt::TokioTimer::new());
-                        let conn = http1_builder.serve_connection(io, service);
+                        // serve_connection_with_upgrades (not serve_connection) so a
+                        // 101 Switching Protocols response actually hands the socket to
+                        // the request's OnUpgrade — required for WebSocket proxying
+                        // (WolfStack + Proxmox consoles). (wabil 2026-06-12.)
+                        let conn = http1_builder.serve_connection_with_upgrades(io, service);
                         
                         // Overall connection lifetime limit: 5 minutes max
                         // This prevents keep-alive connections from leaking FDs forever
@@ -1127,9 +1131,20 @@ fn apply_rewrite(rule: &nginx::RewriteRule, path: &str) -> Option<Response> {
 }
 
 /// Handle proxy pass
+/// True when these request headers are a WebSocket / protocol upgrade:
+/// an `Upgrade` header plus `upgrade` listed in the `Connection` token
+/// list (which may be e.g. "keep-alive, Upgrade"). Case-insensitive.
+fn is_ws_upgrade(headers: &HeaderMap) -> bool {
+    headers.get(header::UPGRADE).is_some()
+        && headers.get(header::CONNECTION)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.split(',').any(|t| t.trim().eq_ignore_ascii_case("upgrade")))
+            .unwrap_or(false)
+}
+
 async fn handle_proxy(
     state: &Arc<AppState>,
-    req: Request,
+    mut req: Request,
     headers: HeaderMap,
     proxy_pass: &str,
     location: &LocationBlock,
@@ -1208,6 +1223,154 @@ async fn handle_proxy(
     // Read the request body once — Bytes is Arc-shared, so retries reuse it cheaply
     let method = req.method().clone();
     let original_uri = req.uri().clone();
+
+    // ── WebSocket / protocol upgrade ──────────────────────────────────
+    // An HTTP request/response proxy can't carry a WebSocket: after the
+    // 101 handshake the connection is a raw bidirectional byte stream.
+    // Forward the handshake to ONE backend with its Upgrade / Connection /
+    // Sec-WebSocket-* headers intact (the normal path strips them), and on
+    // a 101 tunnel the two upgraded sockets together. Without this every
+    // WebSocket hangs — WolfStack & Proxmox consoles, live log streams.
+    // (wabil 2026-06-12.) The incoming side resolves only because the
+    // server is served with serve_connection_with_upgrades.
+    if is_ws_upgrade(&headers) {
+        // One backend only — an upgrade handshake can't be replayed.
+        let (backend_url, backend_opt): (String, Option<BackendServer>) = match &target {
+            ProxyTarget::LoadBalanced { lb, affinity_key } => match lb.next_server(affinity_key.as_deref(), &[]) {
+                Some(s) => (s.url.clone(), Some(s)),
+                None => return (StatusCode::BAD_GATEWAY, "No healthy upstream servers").into_response(),
+            },
+            ProxyTarget::Direct { url } => (url.clone(), None),
+        };
+        let proxy_url = format!("{}{}", backend_url.trim_end_matches('/'), path_suffix);
+        let uri: Uri = match proxy_url.parse() {
+            Ok(u) => u,
+            Err(e) => {
+                error!("Invalid WebSocket upstream URL {}: {}", proxy_url, e);
+                return (StatusCode::BAD_GATEWAY, "Invalid upstream URL").into_response();
+            }
+        };
+
+        // Build the upstream handshake request. KEEP the upgrade headers
+        // (connection, upgrade, sec-websocket-*) the normal path strips, but
+        // still drop host (re-set below), content-length and the OTHER
+        // hop-by-hop headers (keep-alive, te, trailer, transfer-encoding) per
+        // RFC 7230 §6.1 so they aren't relayed to the upstream.
+        let mut up_builder = hyper::Request::builder()
+            .method(method.clone())
+            .uri(&uri)
+            .version(hyper::Version::HTTP_11);
+        for (name, value) in headers.iter() {
+            let n = name.as_str().to_lowercase();
+            if n == "host" || n == "content-length" || n == "keep-alive" || n == "te"
+                || n == "trailer" || n == "transfer-encoding"
+                || n == "proxy-authorization" || n == "proxy-connection" {
+                continue;
+            }
+            up_builder = up_builder.header(name, value);
+        }
+        // Custom proxy_set_header directives (Host, X-Forwarded-*, …) — but
+        // never a second Connection/Upgrade; the originals were forwarded.
+        let mut custom: HashMap<String, String> = HashMap::new();
+        for ph in &location.proxy_headers {
+            custom.insert(ph.name.to_lowercase(), expand_proxy_header_value(&ph.value, &headers, client_addr, is_https));
+        }
+        for ph in server_headers {
+            let k = ph.name.to_lowercase();
+            custom.entry(k).or_insert_with(|| expand_proxy_header_value(&ph.value, &headers, client_addr, is_https));
+        }
+        if !custom.contains_key("host") {
+            if let Some(h) = uri.host() {
+                custom.insert("host".to_string(), match uri.port() {
+                    Some(p) => format!("{}:{}", h, p),
+                    None => h.to_string(),
+                });
+            }
+        }
+        for (name, value) in &custom {
+            if value.is_empty() || name == "connection" || name == "upgrade" { continue; }
+            if let (Ok(hn), Ok(hv)) = (HeaderName::from_str(name), HeaderValue::from_str(value)) {
+                up_builder = up_builder.header(hn, hv);
+            }
+        }
+        let up_req = match up_builder.body(Full::new(Bytes::new())) {
+            Ok(r) => r,
+            Err(e) => {
+                error!("Failed to build WebSocket upstream request: {}", e);
+                return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to build upgrade request").into_response();
+            }
+        };
+
+        // Capture the client (browser) upgrade BEFORE sending upstream; it
+        // resolves once hyper flushes our 101 below and takes over the socket.
+        let client_up = hyper::upgrade::on(&mut req);
+
+        let mut up_resp = match state.http_client.request(up_req).await {
+            Ok(r) => r,
+            Err(e) => {
+                if let Some(ref b) = backend_opt { b.record_failure(); }
+                warn!("WebSocket upstream connect failed {} -> {}: {:?}", original_uri, uri, e);
+                return (StatusCode::BAD_GATEWAY, "WebSocket upstream connection failed").into_response();
+            }
+        };
+
+        // Upstream declined the upgrade — relay its real response (401/404/…)
+        // rather than fabricate a 101 the client can't complete. Strip the
+        // full hop-by-hop set (same as the normal response path) so a
+        // non-101 reply never leaks `connection: upgrade` to the browser.
+        if up_resp.status() != StatusCode::SWITCHING_PROTOCOLS {
+            if let Some(ref b) = backend_opt { b.record_success(); } // reachable, just declined
+            let status = up_resp.status();
+            let mut out = Response::builder().status(status);
+            for (name, value) in up_resp.headers().iter() {
+                let n = name.as_str().to_lowercase();
+                if n == "connection" || n == "keep-alive" || n == "transfer-encoding"
+                    || n == "te" || n == "trailer" || n == "upgrade" || n == "content-length" {
+                    continue;
+                }
+                out = out.header(name, value);
+            }
+            return out.body(Body::new(up_resp.into_body()))
+                .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Failed to build response").into_response());
+        }
+
+        // 101 — record the backend healthy, capture the upstream upgrade, then
+        // tunnel the two sockets in a detached task. The two upgrade handshakes
+        // are bounded by a timeout so a half-open upgrade (101 sent, socket
+        // then dropped) can't leak the task forever; the copy itself runs
+        // unbounded for the life of the console session.
+        if let Some(ref b) = backend_opt { b.record_success(); }
+        let upstream_up = hyper::upgrade::on(&mut up_resp);
+        tokio::spawn(async move {
+            let pair = tokio::time::timeout(
+                Duration::from_secs(30),
+                async { Ok::<_, hyper::Error>((client_up.await?, upstream_up.await?)) },
+            ).await;
+            match pair {
+                Ok(Ok((client_io, server_io))) => {
+                    let mut c = TokioIo::new(client_io);
+                    let mut s = TokioIo::new(server_io);
+                    if let Err(e) = tokio::io::copy_bidirectional(&mut c, &mut s).await {
+                        debug!("WebSocket tunnel closed: {}", e);
+                    }
+                }
+                Ok(Err(e)) => warn!("WebSocket upgrade handshake failed: {}", e),
+                Err(_) => warn!("WebSocket upgrade timed out before both sides completed"),
+            }
+        });
+
+        // Relay the upstream's 101 (Sec-WebSocket-Accept, Upgrade, Connection,
+        // any negotiated subprotocol) so hyper upgrades the client side.
+        let mut out = Response::builder().status(StatusCode::SWITCHING_PROTOCOLS);
+        for (name, value) in up_resp.headers().iter() {
+            let n = name.as_str().to_lowercase();
+            if n == "transfer-encoding" || n == "content-length" { continue; }
+            out = out.header(name, value);
+        }
+        return out.body(Body::empty())
+            .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Failed to build upgrade response").into_response());
+    }
+
     let (_parts, body) = req.into_parts();
     let body_bytes = match body.collect().await {
         Ok(b) => b.to_bytes(),
