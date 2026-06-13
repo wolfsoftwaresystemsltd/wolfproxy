@@ -113,8 +113,7 @@ pub struct MonitoringState {
 fn check_auth(headers: &HeaderMap, username: &str, password: &str) -> bool {
     if let Some(auth_header) = headers.get(header::AUTHORIZATION) {
         if let Ok(auth_str) = auth_header.to_str() {
-            if auth_str.starts_with("Basic ") {
-                let encoded = &auth_str[6..];
+            if let Some(encoded) = auth_str.strip_prefix("Basic ") {
                 if let Ok(decoded) = BASE64.decode(encoded) {
                     if let Ok(credentials) = String::from_utf8(decoded) {
                         let expected = format!("{}:{}", username, password);

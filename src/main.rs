@@ -306,6 +306,16 @@ async fn run_config_test(config_path: &str) -> i32 {
         nginx_config.upstreams.len(),
         config.nginx.config_dir,
     );
+    // Report include problems so the operator sees that a directive pulled in
+    // nothing — previously `--test` said "OK" no matter what the includes did,
+    // which is exactly what left wabil with no signal (2026-06-13). These are
+    // warnings, not hard failures: a missing include never takes the proxy
+    // down (it just isn't loaded), and failing here would make WolfStack's
+    // reload-gate refuse to reload a node that had a pre-existing broken
+    // include. The server-block count above is the real signal.
+    for w in &nginx_config.include_warnings {
+        println!("wolfproxy: include warning — {w}");
+    }
     0
 }
 
@@ -461,10 +471,17 @@ password = "admin"
     // Load nginx configuration
     let nginx_config = nginx::load_nginx_config(Path::new(&config.nginx.config_dir));
     
-    info!("Loaded {} server blocks and {} upstreams", 
-          nginx_config.servers.len(), 
+    info!("Loaded {} server blocks and {} upstreams",
+          nginx_config.servers.len(),
           nginx_config.upstreams.len());
-    
+
+    // Surface include problems loudly — a glob that matched nothing or a
+    // missing include file otherwise produces a silently-empty config and an
+    // operator with no idea why their site isn't served (wabil, 2026-06-13).
+    for w in &nginx_config.include_warnings {
+        warn!("nginx config: {}", w);
+    }
+
     // Build virtual hosts map
     let mut vhosts: HashMap<String, VirtualHost> = HashMap::new();
     let mut default_vhosts: HashMap<u16, VirtualHost> = HashMap::new();
@@ -1142,6 +1159,11 @@ fn is_ws_upgrade(headers: &HeaderMap) -> bool {
             .unwrap_or(false)
 }
 
+// The 8 parameters are the full per-request proxy context (connection, parsed
+// route, server-level headers, TLS flag). Bundling them into a struct purely
+// to satisfy the lint would add indirection to the hot request path without
+// making the call site clearer, so this one is allowed deliberately.
+#[allow(clippy::too_many_arguments)]
 async fn handle_proxy(
     state: &Arc<AppState>,
     mut req: Request,
@@ -1187,7 +1209,9 @@ async fn handle_proxy(
     let path_suffix = req.uri().path_and_query().map(|pq| pq.to_string()).unwrap_or_default();
 
     let target: ProxyTarget = if proxy_pass.starts_with("http://") || proxy_pass.starts_with("https://") {
-        let after_scheme = if proxy_pass.starts_with("https://") { &proxy_pass[8..] } else { &proxy_pass[7..] };
+        let after_scheme = proxy_pass.strip_prefix("https://")
+            .or_else(|| proxy_pass.strip_prefix("http://"))
+            .unwrap_or(proxy_pass);
         let potential_upstream = after_scheme.split('/').next().unwrap_or(after_scheme);
         let potential_upstream = potential_upstream.split(':').next().unwrap_or(potential_upstream);
 
@@ -1448,10 +1472,8 @@ async fn handle_proxy(
         }
         for ph in server_headers {
             let key = ph.name.to_lowercase();
-            if !custom_headers.contains_key(&key) {
-                let value = expand_proxy_header_value(&ph.value, &headers, client_addr, is_https);
-                custom_headers.insert(key, value);
-            }
+            custom_headers.entry(key).or_insert_with(||
+                expand_proxy_header_value(&ph.value, &headers, client_addr, is_https));
         }
         if !custom_headers.contains_key("host") {
             if let Some(host) = uri.host() {

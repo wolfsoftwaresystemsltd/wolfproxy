@@ -236,6 +236,15 @@ pub struct NginxConfig {
     pub upstreams: HashMap<String, Upstream>,
     pub servers: Vec<ServerBlock>,
     pub includes: Vec<PathBuf>,
+    /// Human-readable problems found while resolving `include` directives:
+    /// a glob that matched no files, an explicit include whose file is
+    /// missing, or an invalid glob pattern. These are NOT part of the proxy's
+    /// routing state — they exist purely so `wolfproxy --test` and the startup
+    /// log can tell the operator their include pulled in nothing, instead of
+    /// failing silently (the wabil report, 2026-06-13). Real nginx errors
+    /// loudly here; WolfProxy used to swallow it.
+    #[serde(default)]
+    pub include_warnings: Vec<String>,
 }
 
 /// Parse an nginx configuration file
@@ -275,15 +284,43 @@ pub fn parse_nginx_content(content: &str, base_dir: Option<&Path>) -> NginxConfi
             
             // Handle glob patterns
             if include.contains('*') {
-                if let Ok(paths) = glob::glob(&include_path.to_string_lossy()) {
-                    for entry in paths.flatten() {
-                        let sub_config = parse_nginx_config(&entry);
-                        merge_configs(&mut config, sub_config);
+                match glob::glob(&include_path.to_string_lossy()) {
+                    Ok(paths) => {
+                        let mut matched = 0usize;
+                        for entry in paths.flatten() {
+                            let sub_config = parse_nginx_config(&entry);
+                            merge_configs(&mut config, sub_config);
+                            matched += 1;
+                        }
+                        // A glob matching nothing is legal in nginx (not an
+                        // error) but is almost always a mistake — e.g.
+                        // `sites-enabled/*.conf` against Debian's extensionless
+                        // symlinks. Surface it so it isn't silent.
+                        if matched == 0 {
+                            config.include_warnings.push(format!(
+                                "include '{}' matched no files — check the path and that the \
+                                 filenames match the pattern (Debian sites-enabled entries often \
+                                 have no .conf suffix, so '*.conf' matches nothing; try '*')",
+                                include_path.display()
+                            ));
+                        }
                     }
+                    Err(e) => config.include_warnings.push(format!(
+                        "include '{}' is not a valid glob pattern: {}", include, e
+                    )),
                 }
             } else if include_path.exists() {
                 let sub_config = parse_nginx_config(&include_path);
                 merge_configs(&mut config, sub_config);
+            } else {
+                // An explicit (non-glob) include of a file that doesn't exist:
+                // real nginx treats this as a fatal `-t` error. We surface it
+                // loudly but don't refuse to load — a proxy that's been running
+                // shouldn't suddenly fail to start on upgrade (see main.rs).
+                config.include_warnings.push(format!(
+                    "include '{}' refers to a file that does not exist",
+                    include_path.display()
+                ));
             }
         }
     }
@@ -395,12 +432,12 @@ fn parse_upstream_server(line: &str) -> Option<UpstreamServer> {
     // Parse additional options
     for part in parts.iter().skip(2) {
         let part = part.trim_end_matches(';');
-        if part.starts_with("weight=") {
-            server.weight = part[7..].parse().unwrap_or(1);
-        } else if part.starts_with("max_fails=") {
-            server.max_fails = part[10..].parse().unwrap_or(1);
-        } else if part.starts_with("fail_timeout=") {
-            let timeout_str = part[13..].trim_end_matches('s');
+        if let Some(v) = part.strip_prefix("weight=") {
+            server.weight = v.parse().unwrap_or(1);
+        } else if let Some(v) = part.strip_prefix("max_fails=") {
+            server.max_fails = v.parse().unwrap_or(1);
+        } else if let Some(v) = part.strip_prefix("fail_timeout=") {
+            let timeout_str = v.trim_end_matches('s');
             server.fail_timeout = timeout_str.parse().unwrap_or(300);
         } else if part == "backup" {
             server.backup = true;
@@ -483,7 +520,7 @@ fn parse_server_content(content: &str, base_dir: Option<&Path>) -> Option<Server
     };
     
     // Parse line by line, handling nested blocks
-    let mut lines = content.lines().peekable();
+    let lines = content.lines().peekable();
     let mut current_location: Option<LocationBlock> = None;
     let mut location_depth = 0;
     let mut location_content = String::new();
@@ -491,7 +528,7 @@ fn parse_server_content(content: &str, base_dir: Option<&Path>) -> Option<Server
     let mut if_content = String::new();
     let mut if_condition = String::new();
     
-    while let Some(line) = lines.next() {
+    for line in lines {
         let trimmed = line.trim();
         
         // Handle if blocks
@@ -863,10 +900,25 @@ fn parse_server_directive(server: &mut ServerBlock, line: &str, base_dir: Option
                         for include_line in content.lines() {
                             let include_trimmed = include_line.trim();
                             if !include_trimmed.is_empty() && !include_trimmed.starts_with('#') {
-                                parse_server_directive(server, include_trimmed, Some(&full_path.parent().unwrap_or(Path::new("/"))));
+                                parse_server_directive(server, include_trimmed, Some(full_path.parent().unwrap_or(Path::new("/"))));
                             }
                         }
                     }
+                } else if include_path.contains('*') {
+                    // Server-context includes pull directives (snippets) into
+                    // the surrounding server; globbing them isn't supported
+                    // here — top-level includes are the place for globs.
+                    eprintln!(
+                        "wolfproxy: include '{}' inside a server block uses a glob, which is only \
+                         supported for top-level includes — the directives were not loaded",
+                        include_path
+                    );
+                } else {
+                    eprintln!(
+                        "wolfproxy: include '{}' inside a server block refers to a file that does \
+                         not exist — the directives were not loaded",
+                        full_path.display()
+                    );
                 }
             }
         }
@@ -914,8 +966,8 @@ fn parse_listen_directive(line: &str) -> Option<ListenDirective> {
     let addr_part = parts[0].trim_end_matches(';');
     
     // Check for [::] IPv6 notation
-    if addr_part.starts_with("[::]:") {
-        listen.port = addr_part[5..].parse().unwrap_or(80);
+    if let Some(port_str) = addr_part.strip_prefix("[::]:") {
+        listen.port = port_str.parse().unwrap_or(80);
         listen.address = Some("[::]:".to_string());
     } else if addr_part.starts_with("[::]") {
         listen.port = 80;
@@ -975,14 +1027,14 @@ fn parse_rewrite_rule(line: &str) -> Option<RewriteRule> {
 
 fn parse_time_value(s: &str) -> Option<u64> {
     let s = s.trim();
-    if s.ends_with('s') {
-        s[..s.len() - 1].parse().ok()
-    } else if s.ends_with('m') {
-        s[..s.len() - 1].parse::<u64>().ok().map(|v| v * 60)
-    } else if s.ends_with('h') {
-        s[..s.len() - 1].parse::<u64>().ok().map(|v| v * 3600)
-    } else if s.ends_with('d') {
-        s[..s.len() - 1].parse::<u64>().ok().map(|v| v * 86400)
+    if let Some(n) = s.strip_suffix('s') {
+        n.parse().ok()
+    } else if let Some(n) = s.strip_suffix('m') {
+        n.parse::<u64>().ok().map(|v| v * 60)
+    } else if let Some(n) = s.strip_suffix('h') {
+        n.parse::<u64>().ok().map(|v| v * 3600)
+    } else if let Some(n) = s.strip_suffix('d') {
+        n.parse::<u64>().ok().map(|v| v * 86400)
     } else {
         s.parse().ok()
     }
@@ -1005,6 +1057,9 @@ fn merge_configs(main: &mut NginxConfig, other: NginxConfig) {
     main.upstreams.extend(other.upstreams);
     main.servers.extend(other.servers);
     main.includes.extend(other.includes);
+    // Bubble include problems up from nested includes so `--test` and the log
+    // see every one, no matter how deep the include chain.
+    main.include_warnings.extend(other.include_warnings);
 }
 
 /// Load the proxy's configuration the way nginx itself does.
@@ -1057,7 +1112,7 @@ pub fn load_nginx_sites(nginx_dir: &Path) -> NginxConfig {
         if let Ok(entries) = fs::read_dir(&conf_d) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().map_or(false, |ext| ext == "conf") {
+                if path.extension().is_some_and(|ext| ext == "conf") {
                     let sub_config = parse_nginx_config(&path);
                     merge_configs(&mut config, sub_config);
                 }
@@ -1150,5 +1205,52 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&dir2);
+    }
+
+    #[test]
+    fn test_include_problems_are_surfaced_not_swallowed() {
+        // A root.conf whose includes resolve to nothing must produce
+        // include_warnings — silence is what left the operator stranded.
+        let dir = std::env::temp_dir().join(format!("wolfproxy-incwarn-{}", std::process::id()));
+        let sites = dir.join("sites-enabled");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&sites).unwrap();
+        // The file exists but has NO .conf suffix (Debian symlink style), so a
+        // `*.conf` glob matches nothing, and an explicit include points at a
+        // file that isn't there.
+        fs::write(sites.join("sonarr"), "server {\n    listen 80;\n    server_name s.example.com;\n}\n").unwrap();
+        fs::write(
+            dir.join("root.conf"),
+            format!(
+                "http {{\n    include {sites}/*.conf;\n    include {sites}/missing.conf;\n}}\n",
+                sites = sites.display()
+            ),
+        )
+        .unwrap();
+
+        let config = load_nginx_config(&dir);
+        assert_eq!(config.servers.len(), 0, "neither include should have matched a server");
+        assert_eq!(config.include_warnings.len(), 2,
+            "both the zero-match glob and the missing explicit include must warn; got {:?}",
+            config.include_warnings);
+        assert!(config.include_warnings.iter().any(|w| w.contains("matched no files")),
+            "zero-match glob warning missing: {:?}", config.include_warnings);
+        assert!(config.include_warnings.iter().any(|w| w.contains("does not exist")),
+            "missing-file warning missing: {:?}", config.include_warnings);
+
+        // Fixing the glob to `*` (which matches the extensionless file) loads
+        // the server AND clears the glob warning.
+        fs::write(
+            dir.join("root.conf"),
+            format!("http {{\n    include {sites}/*;\n}}\n", sites = sites.display()),
+        )
+        .unwrap();
+        let ok = load_nginx_config(&dir);
+        assert!(ok.servers.iter().any(|s| s.server_names.iter().any(|n| n == "s.example.com")),
+            "`*` should match the extensionless file and load its server");
+        assert!(ok.include_warnings.is_empty(),
+            "a healthy include must produce no warnings; got {:?}", ok.include_warnings);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

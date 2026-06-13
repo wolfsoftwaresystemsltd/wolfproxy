@@ -150,16 +150,13 @@ pub struct Firewall {
 #[allow(dead_code)]
 impl Firewall {
     pub fn new(config: FirewallConfig) -> Self {
-        let fw = Self {
+        Self {
             config,
             blocked: DashMap::new(),
             trackers: DashMap::new(),
             total_blocks: AtomicU64::new(0),
             total_denied: AtomicU64::new(0),
-        };
-
-        // Spawn cleanup task
-        fw
+        }
     }
 
     /// Check if an IP is blocked. Returns true if blocked.
