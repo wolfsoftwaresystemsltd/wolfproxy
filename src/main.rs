@@ -299,7 +299,7 @@ async fn run_config_test(config_path: &str) -> i32 {
             return 1;
         }
     };
-    let nginx_config = nginx::load_nginx_sites(Path::new(&config.nginx.config_dir));
+    let nginx_config = nginx::load_nginx_config(Path::new(&config.nginx.config_dir));
     println!(
         "wolfproxy: configuration OK — {} server block(s), {} upstream(s) from {}",
         nginx_config.servers.len(),
@@ -459,7 +459,7 @@ password = "admin"
     info!("Loading nginx configuration from {}", config.nginx.config_dir);
     
     // Load nginx configuration
-    let nginx_config = nginx::load_nginx_sites(Path::new(&config.nginx.config_dir));
+    let nginx_config = nginx::load_nginx_config(Path::new(&config.nginx.config_dir));
     
     info!("Loaded {} server blocks and {} upstreams", 
           nginx_config.servers.len(), 

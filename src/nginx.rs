@@ -1007,6 +1007,32 @@ fn merge_configs(main: &mut NginxConfig, other: NginxConfig) {
     main.includes.extend(other.includes);
 }
 
+/// Load the proxy's configuration the way nginx itself does.
+///
+/// nginx has no auto-discovery: it reads ONE main config file and that file's
+/// `include` directives pull in everything else (conf.d, sites, subfolders —
+/// relative paths and `*` globs both work, resolved against each file's own
+/// directory). WolfProxy now honours that model: if a main config file exists
+/// in `nginx_dir`, parse it and let its includes do the work.
+///
+/// The conventional main file is `root.conf`. It is a non-standard filename, so
+/// detecting it *by presence* can only ever opt a user IN — an existing install
+/// that doesn't have one keeps the historical auto-scan behaviour below,
+/// unchanged. (We deliberately do NOT auto-adopt `nginx.conf`: on a box that
+/// also has nginx installed that file already exists and adopting it could
+/// change what an existing WolfProxy install loads.)
+pub fn load_nginx_config(nginx_dir: &Path) -> NginxConfig {
+    let main = nginx_dir.join("root.conf");
+    if main.is_file() {
+        // parse_nginx_config sets base_dir = nginx_dir, so the main file's
+        // includes resolve exactly like nginx, recursively.
+        return parse_nginx_config(&main);
+    }
+    // No main config — fall back to auto-scanning sites-enabled/ + conf.d/
+    // (the original WolfProxy behaviour; kept so nothing breaks on upgrade).
+    load_nginx_sites(nginx_dir)
+}
+
 /// Load all nginx configurations from sites-enabled
 pub fn load_nginx_sites(nginx_dir: &Path) -> NginxConfig {
     let mut config = NginxConfig::default();
@@ -1077,5 +1103,52 @@ mod tests {
         let listen2 = parse_listen_directive("listen [::]:80 default_server;").unwrap();
         assert_eq!(listen2.port, 80);
         assert!(listen2.default_server);
+    }
+
+    #[test]
+    fn test_root_conf_includes_subfolders_like_nginx() {
+        // A root.conf that pulls in a subfolder via a glob include — the
+        // nginx model. The server defined in the included file must show up.
+        let dir = std::env::temp_dir().join(format!("wolfproxy-rootconf-{}", std::process::id()));
+        let sites = dir.join("sites");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&sites).unwrap();
+
+        fs::write(
+            dir.join("root.conf"),
+            "http {\n    include sites/*.conf;\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            sites.join("app.conf"),
+            "server {\n    listen 443 ssl;\n    server_name app.example.com;\n}\n",
+        )
+        .unwrap();
+
+        let config = load_nginx_config(&dir);
+        assert!(
+            config.servers.iter().any(|s| s.server_names.iter().any(|n| n == "app.example.com")),
+            "included server from sites/app.conf should be loaded via root.conf include; got {} server(s)",
+            config.servers.len()
+        );
+
+        // And with NO root.conf, it must fall back to the auto-scan (conf.d).
+        let dir2 = std::env::temp_dir().join(format!("wolfproxy-autoscan-{}", std::process::id()));
+        let confd = dir2.join("conf.d");
+        let _ = fs::remove_dir_all(&dir2);
+        fs::create_dir_all(&confd).unwrap();
+        fs::write(
+            confd.join("site.conf"),
+            "server {\n    listen 80;\n    server_name legacy.example.com;\n}\n",
+        )
+        .unwrap();
+        let config2 = load_nginx_config(&dir2);
+        assert!(
+            config2.servers.iter().any(|s| s.server_names.iter().any(|n| n == "legacy.example.com")),
+            "auto-scan fallback should still load conf.d servers when there's no root.conf"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir2);
     }
 }
