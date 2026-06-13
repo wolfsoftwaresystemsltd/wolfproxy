@@ -449,6 +449,105 @@ fn parse_upstream_server(line: &str) -> Option<UpstreamServer> {
     Some(server)
 }
 
+/// Maximum `include` nesting depth inside a server block — a guard against a
+/// cyclic or pathological include chain.
+const MAX_SERVER_INCLUDE_DEPTH: usize = 16;
+
+/// Textually expand `include` directives found inside a server block, returning
+/// the body with each include replaced by the (recursively expanded) contents
+/// of the file(s) it matches. nginx treats `include` as a textual inclusion at
+/// parse time, so an included file may itself contain `location { ... }`
+/// blocks, flat directives, or further includes — all parsed in the
+/// surrounding server context. `*` globs are supported here exactly as at the
+/// top level (a zero-match glob is not an error); a missing literal file or an
+/// invalid glob is warned about and skipped.
+///
+/// Before this, server-block includes were fed line-by-line to
+/// `parse_server_directive`, which can't parse nested `location` blocks, and
+/// globs were rejected outright — so an `include sites/*.conf;` inside a server
+/// silently dropped every directive (wabil 2026-06-13).
+fn expand_server_includes(body: &str, base_dir: Option<&Path>, depth: usize) -> String {
+    if depth >= MAX_SERVER_INCLUDE_DEPTH {
+        eprintln!(
+            "wolfproxy: server-block include nesting exceeded {} levels — stopping (possible include cycle)",
+            MAX_SERVER_INCLUDE_DEPTH
+        );
+        return body.to_string();
+    }
+    let base = base_dir.unwrap_or(Path::new("/"));
+    let mut out = String::with_capacity(body.len());
+    for line in body.lines() {
+        // Match an `include <path>;` directive specifically — not `include_foo`
+        // or a value that merely contains the word.
+        let inc = line.trim()
+            .strip_prefix("include")
+            .filter(|rest| rest.starts_with(|c: char| c.is_whitespace()))
+            .map(|rest| rest.trim().trim_end_matches(';').trim().trim_matches('"').trim_matches('\''))
+            .filter(|p| !p.is_empty());
+        let Some(path) = inc else {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        };
+        let resolved = if path.starts_with('/') { PathBuf::from(path) } else { base.join(path) };
+        let mut files: Vec<PathBuf> = if path.contains('*') {
+            match glob::glob(&resolved.to_string_lossy()) {
+                Ok(paths) => {
+                    let matched: Vec<PathBuf> = paths.flatten().collect();
+                    // A zero-match glob is legal in nginx (not an error), but
+                    // almost always a mistake — surface it. Reported only here,
+                    // so a glob ERROR (below) doesn't also trip a "no files".
+                    if matched.is_empty() {
+                        eprintln!("wolfproxy: include '{}' inside a server block matched no files", resolved.display());
+                    }
+                    matched
+                }
+                Err(e) => {
+                    eprintln!("wolfproxy: include '{}' inside a server block is not a valid glob: {}", path, e);
+                    Vec::new()
+                }
+            }
+        } else if resolved.exists() {
+            vec![resolved.clone()]
+        } else {
+            eprintln!("wolfproxy: include '{}' inside a server block refers to a file that does not exist", resolved.display());
+            Vec::new()
+        };
+        // Deterministic, nginx-like lexical order regardless of glob() ordering.
+        files.sort();
+        for f in files {
+            match fs::read_to_string(&f) {
+                Ok(content) => {
+                    let stripped = remove_comments(&content);
+                    // A server-context include is meant to pull in directives /
+                    // location blocks — NOT a whole `server { }` (nginx can't
+                    // nest those). If a file carries one it was meant as a
+                    // top-level include (where find_includes already loads it),
+                    // so skip it here rather than inject a server-in-server and
+                    // silently fold its directives into the outer server.
+                    let has_server_block = stripped.lines().any(|l| {
+                        l.trim().strip_prefix("server")
+                            .map(|r| r.trim_start().starts_with('{'))
+                            .unwrap_or(false)
+                    });
+                    if has_server_block {
+                        eprintln!(
+                            "wolfproxy: server-block include '{}' contains a `server {{ }}` block, which can't be nested inside another server — skipping it (use a top-level include for full server blocks)",
+                            f.display()
+                        );
+                        continue;
+                    }
+                    let child_base = f.parent().unwrap_or(base);
+                    out.push_str(&expand_server_includes(&stripped, Some(child_base), depth + 1));
+                    if !out.ends_with('\n') { out.push('\n'); }
+                }
+                Err(e) => eprintln!("wolfproxy: could not read server include '{}': {}", f.display(), e),
+            }
+        }
+    }
+    out
+}
+
 fn parse_server_blocks(content: &str, base_dir: Option<&Path>) -> Vec<ServerBlock> {
     let mut servers = Vec::new();
     
@@ -483,8 +582,11 @@ fn parse_server_blocks(content: &str, base_dir: Option<&Path>) -> Vec<ServerBloc
             }
             
             if brace_count == 0 {
-                // End of server block
-                if let Some(server) = parse_server_content(&server_content, base_dir) {
+                // End of server block. Expand any `include`s textually first so
+                // included location/if blocks and directives parse in the server
+                // context (nginx's textual-include semantics).
+                let expanded = expand_server_includes(&server_content, base_dir, 0);
+                if let Some(server) = parse_server_content(&expanded) {
                     servers.push(server);
                 }
                 in_server = false;
@@ -499,7 +601,7 @@ fn parse_server_blocks(content: &str, base_dir: Option<&Path>) -> Vec<ServerBloc
     servers
 }
 
-fn parse_server_content(content: &str, base_dir: Option<&Path>) -> Option<ServerBlock> {
+fn parse_server_content(content: &str) -> Option<ServerBlock> {
     let mut server = ServerBlock {
         listen: Vec::new(),
         server_names: Vec::new(),
@@ -591,7 +693,7 @@ fn parse_server_content(content: &str, base_dir: Option<&Path>) -> Option<Server
         }
         
         // Parse server-level directives
-        parse_server_directive(&mut server, trimmed, base_dir);
+        parse_server_directive(&mut server, trimmed);
     }
     
     Some(server)
@@ -760,7 +862,7 @@ fn parse_location_content(loc: &mut LocationBlock, content: &str) {
     }
 }
 
-fn parse_server_directive(server: &mut ServerBlock, line: &str, base_dir: Option<&Path>) {
+fn parse_server_directive(server: &mut ServerBlock, line: &str) {
     if line.starts_with("listen") {
         if let Some(listen) = parse_listen_directive(line) {
             if listen.default_server {
@@ -881,48 +983,11 @@ fn parse_server_directive(server: &mut ServerBlock, line: &str, base_dir: Option
                 value: value.to_string(),
             });
         }
-    } else if line.starts_with("include") {
-        // Handle includes within server block
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 2 {
-            let include_path = parts[1].trim_end_matches(';').trim_matches('"').trim_matches('\'');
-            // Process the include file - this adds SSL settings from included snippets
-            if let Some(base) = base_dir {
-                let full_path = if include_path.starts_with('/') {
-                    PathBuf::from(include_path)
-                } else {
-                    base.join(include_path)
-                };
-                
-                if full_path.exists() {
-                    if let Ok(content) = fs::read_to_string(&full_path) {
-                        // Parse directives from included file
-                        for include_line in content.lines() {
-                            let include_trimmed = include_line.trim();
-                            if !include_trimmed.is_empty() && !include_trimmed.starts_with('#') {
-                                parse_server_directive(server, include_trimmed, Some(full_path.parent().unwrap_or(Path::new("/"))));
-                            }
-                        }
-                    }
-                } else if include_path.contains('*') {
-                    // Server-context includes pull directives (snippets) into
-                    // the surrounding server; globbing them isn't supported
-                    // here — top-level includes are the place for globs.
-                    eprintln!(
-                        "wolfproxy: include '{}' inside a server block uses a glob, which is only \
-                         supported for top-level includes — the directives were not loaded",
-                        include_path
-                    );
-                } else {
-                    eprintln!(
-                        "wolfproxy: include '{}' inside a server block refers to a file that does \
-                         not exist — the directives were not loaded",
-                        full_path.display()
-                    );
-                }
-            }
-        }
     }
+    // NB: `include` inside a server block is handled BEFORE this function, by
+    // expand_server_includes (textual expansion in parse_server_blocks), so the
+    // included content — including nested location blocks — is parsed in the
+    // proper server context. No include arm here.
 }
 
 fn parse_if_block(condition: &str, content: &str) -> Option<IfCondition> {
@@ -1252,5 +1317,88 @@ mod tests {
             "a healthy include must produce no warnings; got {:?}", ok.include_warnings);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_server_block_glob_include_loads_locations() {
+        // wabil 2026-06-13: `include sites/*.conf;` INSIDE a server block, where
+        // the included file holds a location block. Previously this logged
+        // "glob only supported for top-level includes" and dropped the
+        // directives; now the locations must load into the server.
+        let dir = std::env::temp_dir().join(format!("wp-srvinc-{}", std::process::id()));
+        let sub = dir.join("sub");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(
+            dir.join("root.conf"),
+            format!(
+                "http {{\n    server {{\n        listen 80;\n        server_name app.example.com;\n        include {}/*.conf;\n    }}\n}}\n",
+                sub.display()
+            ),
+        )
+        .unwrap();
+        // Two included files with location blocks — both must merge in.
+        fs::write(sub.join("api.conf"),
+            "location /api/ {\n    proxy_pass http://127.0.0.1:9000;\n}\n").unwrap();
+        fs::write(sub.join("static.conf"),
+            "location /static/ {\n    proxy_pass http://127.0.0.1:9001;\n}\n").unwrap();
+
+        let config = load_nginx_config(&dir);
+        let _ = fs::remove_dir_all(&dir);
+        let srv = config.servers.iter()
+            .find(|s| s.server_names.iter().any(|n| n == "app.example.com"))
+            .expect("server app.example.com should be parsed");
+        assert!(srv.locations.len() >= 2,
+            "both globbed server-block includes should load; got {} location(s): {:?}",
+            srv.locations.len(), srv.locations.iter().map(|l| &l.path).collect::<Vec<_>>());
+        assert!(srv.locations.iter().any(|l| l.proxy_pass.as_deref().is_some_and(|p| p.contains("9000"))),
+            "included /api/ location's proxy_pass should be loaded; got {:?}",
+            srv.locations.iter().map(|l| &l.proxy_pass).collect::<Vec<_>>());
+        assert!(srv.locations.iter().any(|l| l.proxy_pass.as_deref().is_some_and(|p| p.contains("9001"))),
+            "included /static/ location's proxy_pass should be loaded");
+    }
+
+    #[test]
+    fn test_server_block_include_recursive_literal_and_skips_nested_server() {
+        let dir = std::env::temp_dir().join(format!("wp-srvinc2-{}", std::process::id()));
+        let sub = dir.join("sub");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&sub).unwrap();
+        // app.example.com pulls in a LITERAL (non-glob) include and a file that
+        // itself includes another (recursion), plus a file that wrongly holds a
+        // full server block.
+        fs::write(
+            dir.join("root.conf"),
+            format!(
+                "http {{\n    server {{\n        listen 80;\n        server_name app.example.com;\n        include {sub}/outer.conf;\n        include {sub}/oops.conf;\n    }}\n}}\n",
+                sub = sub.display()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            sub.join("outer.conf"),
+            format!("location /a/ {{\n    proxy_pass http://127.0.0.1:7000;\n}}\ninclude {}/inner.conf;\n", sub.display()),
+        )
+        .unwrap();
+        fs::write(sub.join("inner.conf"),
+            "location /b/ {\n    proxy_pass http://127.0.0.1:7001;\n}\n").unwrap();
+        // A full server block — must be skipped by the guard, NOT folded into app.
+        fs::write(sub.join("oops.conf"),
+            "server {\n    listen 81;\n    server_name nested.example.com;\n    location /evil/ { proxy_pass http://127.0.0.1:6666; }\n}\n").unwrap();
+
+        let config = load_nginx_config(&dir);
+        let _ = fs::remove_dir_all(&dir);
+        let srv = config.servers.iter()
+            .find(|s| s.server_names.iter().any(|n| n == "app.example.com"))
+            .expect("app.example.com server should parse");
+        // Literal include and the recursively-included file both loaded.
+        assert!(srv.locations.iter().any(|l| l.proxy_pass.as_deref().is_some_and(|p| p.contains("7000"))),
+            "literal server-block include (/a/) should load; got {:?}",
+            srv.locations.iter().map(|l| &l.proxy_pass).collect::<Vec<_>>());
+        assert!(srv.locations.iter().any(|l| l.proxy_pass.as_deref().is_some_and(|p| p.contains("7001"))),
+            "recursively-included (/b/) should load");
+        // The nested `server { }` must NOT fold its directives into app.
+        assert!(!srv.locations.iter().any(|l| l.proxy_pass.as_deref().is_some_and(|p| p.contains("6666"))),
+            "a server{{}}-containing include must be skipped, not folded into the outer server");
     }
 }
