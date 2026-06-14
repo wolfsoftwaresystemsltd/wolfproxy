@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 use std::fs;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 use regex::Regex;
 
@@ -248,7 +248,11 @@ pub struct NginxConfig {
 }
 
 /// Parse an nginx configuration file
-pub fn parse_nginx_config(path: &Path) -> NginxConfig {
+/// Read and parse one config file, carrying the config-root `prefix` (the
+/// directory of the main config) down through nested includes so relative
+/// include paths can be resolved the way nginx does (against the prefix) as well
+/// as against the including file's own directory. See `include_candidate_paths`.
+fn parse_nginx_config_in(path: &Path, prefix: Option<&Path>) -> NginxConfig {
     let content = match fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) => {
@@ -256,75 +260,105 @@ pub fn parse_nginx_config(path: &Path) -> NginxConfig {
             return NginxConfig::default();
         }
     };
-    
-    parse_nginx_content(&content, path.parent())
+
+    parse_nginx_content_in(&content, path.parent(), prefix)
 }
 
-/// Parse nginx configuration content
-pub fn parse_nginx_content(content: &str, base_dir: Option<&Path>) -> NginxConfig {
+/// The filesystem paths a (possibly glob) include should be resolved against:
+/// the including file's directory first — wolfproxy's historical behaviour, so a
+/// config that already works keeps working — and then the config-root `prefix`,
+/// which is how nginx itself resolves a relative include. The two are merged
+/// (de-duplicated by their string form) and the caller further de-duplicates the
+/// actual matched files by canonical path, so a file reachable both ways is only
+/// ever loaded once. An absolute include resolves to just itself.
+fn include_candidate_paths(include: &str, base: &Path, prefix: Option<&Path>) -> Vec<PathBuf> {
+    if include.starts_with('/') {
+        return vec![PathBuf::from(include)];
+    }
+    let mut candidates = vec![base.join(include)];
+    if let Some(p) = prefix {
+        let pj = p.join(include);
+        if !candidates.contains(&pj) {
+            candidates.push(pj);
+        }
+    }
+    candidates
+}
+
+fn parse_nginx_content_in(content: &str, base_dir: Option<&Path>, prefix: Option<&Path>) -> NginxConfig {
     let mut config = NginxConfig::default();
-    
+
     // Remove comments but preserve strings
     let content = remove_comments(content);
-    
+
     // Parse upstreams
     config.upstreams = parse_upstreams(&content);
-    
+
     // Parse server blocks
-    config.servers = parse_server_blocks(&content, base_dir);
-    
+    config.servers = parse_server_blocks(&content, base_dir, prefix);
+
     // Parse includes and merge
     if let Some(base) = base_dir {
         for include in find_includes(&content) {
-            let include_path = if include.starts_with('/') {
-                PathBuf::from(&include)
-            } else {
-                base.join(&include)
-            };
-            
+            let candidates = include_candidate_paths(&include, base, prefix);
+
             // Handle glob patterns
             if include.contains('*') {
-                match glob::glob(&include_path.to_string_lossy()) {
-                    Ok(paths) => {
-                        let mut matched = 0usize;
-                        for entry in paths.flatten() {
-                            let sub_config = parse_nginx_config(&entry);
-                            merge_configs(&mut config, sub_config);
-                            matched += 1;
+                // Merge matches from every candidate root, de-duplicated by
+                // canonical path so a file reachable both relative-to-file and
+                // relative-to-prefix isn't loaded (and merged) twice.
+                let mut seen: HashSet<PathBuf> = HashSet::new();
+                let mut matched = 0usize;
+                let mut glob_error: Option<String> = None;
+                for cand in &candidates {
+                    match glob::glob(&cand.to_string_lossy()) {
+                        Ok(paths) => {
+                            for entry in paths.flatten() {
+                                let key = fs::canonicalize(&entry).unwrap_or_else(|_| entry.clone());
+                                if seen.insert(key) {
+                                    let sub_config = parse_nginx_config_in(&entry, prefix);
+                                    merge_configs(&mut config, sub_config);
+                                    matched += 1;
+                                }
+                            }
                         }
-                        // A glob matching nothing is legal in nginx (not an
-                        // error) but is almost always a mistake — e.g.
-                        // `sites-enabled/*.conf` against Debian's extensionless
-                        // symlinks. Surface it so it isn't silent.
-                        if matched == 0 {
-                            config.include_warnings.push(format!(
-                                "include '{}' matched no files — check the path and that the \
-                                 filenames match the pattern (Debian sites-enabled entries often \
-                                 have no .conf suffix, so '*.conf' matches nothing; try '*')",
-                                include_path.display()
-                            ));
-                        }
+                        Err(e) => glob_error = Some(e.to_string()),
                     }
-                    Err(e) => config.include_warnings.push(format!(
-                        "include '{}' is not a valid glob pattern: {}", include, e
-                    )),
                 }
-            } else if include_path.exists() {
-                let sub_config = parse_nginx_config(&include_path);
+                // A glob matching nothing is legal in nginx (not an error) but is
+                // almost always a mistake — e.g. `sites-enabled/*.conf` against
+                // Debian's extensionless symlinks. Surface it so it isn't silent.
+                if matched == 0 {
+                    if let Some(e) = glob_error {
+                        config.include_warnings.push(format!(
+                            "include '{}' is not a valid glob pattern: {}", include, e
+                        ));
+                    } else {
+                        config.include_warnings.push(format!(
+                            "include '{}' matched no files — check the path and that the \
+                             filenames match the pattern (Debian sites-enabled entries often \
+                             have no .conf suffix, so '*.conf' matches nothing; try '*')",
+                            include
+                        ));
+                    }
+                }
+            } else if let Some(found) = candidates.iter().find(|c| c.exists()) {
+                let sub_config = parse_nginx_config_in(found, prefix);
                 merge_configs(&mut config, sub_config);
             } else {
                 // An explicit (non-glob) include of a file that doesn't exist:
                 // real nginx treats this as a fatal `-t` error. We surface it
                 // loudly but don't refuse to load — a proxy that's been running
                 // shouldn't suddenly fail to start on upgrade (see main.rs).
+                let looked = candidates.iter().map(|c| c.display().to_string()).collect::<Vec<_>>().join(" or ");
                 config.include_warnings.push(format!(
-                    "include '{}' refers to a file that does not exist",
-                    include_path.display()
+                    "include '{}' refers to a file that does not exist (looked in {})",
+                    include, looked
                 ));
             }
         }
     }
-    
+
     config
 }
 
@@ -466,7 +500,7 @@ const MAX_SERVER_INCLUDE_DEPTH: usize = 16;
 /// `parse_server_directive`, which can't parse nested `location` blocks, and
 /// globs were rejected outright — so an `include sites/*.conf;` inside a server
 /// silently dropped every directive (wabil 2026-06-13).
-fn expand_server_includes(body: &str, base_dir: Option<&Path>, depth: usize) -> String {
+fn expand_server_includes(body: &str, base_dir: Option<&Path>, prefix: Option<&Path>, depth: usize) -> String {
     if depth >= MAX_SERVER_INCLUDE_DEPTH {
         eprintln!(
             "wolfproxy: server-block include nesting exceeded {} levels — stopping (possible include cycle)",
@@ -489,30 +523,36 @@ fn expand_server_includes(body: &str, base_dir: Option<&Path>, depth: usize) -> 
             out.push('\n');
             continue;
         };
-        let resolved = if path.starts_with('/') { PathBuf::from(path) } else { base.join(path) };
-        let mut files: Vec<PathBuf> = if path.contains('*') {
-            match glob::glob(&resolved.to_string_lossy()) {
-                Ok(paths) => {
-                    let matched: Vec<PathBuf> = paths.flatten().collect();
-                    // A zero-match glob is legal in nginx (not an error), but
-                    // almost always a mistake — surface it. Reported only here,
-                    // so a glob ERROR (below) doesn't also trip a "no files".
-                    if matched.is_empty() {
-                        eprintln!("wolfproxy: include '{}' inside a server block matched no files", resolved.display());
+        // Resolve against the including file's dir AND the config prefix (nginx
+        // semantics), merging matches de-duplicated by canonical path so a file
+        // reachable both ways is expanded only once.
+        let candidates = include_candidate_paths(path, base, prefix);
+        let mut files: Vec<PathBuf> = Vec::new();
+        let mut seen: HashSet<PathBuf> = HashSet::new();
+        if path.contains('*') {
+            let mut glob_error: Option<String> = None;
+            for cand in &candidates {
+                match glob::glob(&cand.to_string_lossy()) {
+                    Ok(paths) => {
+                        for entry in paths.flatten() {
+                            let key = fs::canonicalize(&entry).unwrap_or_else(|_| entry.clone());
+                            if seen.insert(key) { files.push(entry); }
+                        }
                     }
-                    matched
-                }
-                Err(e) => {
-                    eprintln!("wolfproxy: include '{}' inside a server block is not a valid glob: {}", path, e);
-                    Vec::new()
+                    Err(e) => glob_error = Some(e.to_string()),
                 }
             }
-        } else if resolved.exists() {
-            vec![resolved.clone()]
+            if files.is_empty() {
+                match glob_error {
+                    Some(e) => eprintln!("wolfproxy: include '{}' inside a server block is not a valid glob: {}", path, e),
+                    None => eprintln!("wolfproxy: include '{}' inside a server block matched no files", path),
+                }
+            }
+        } else if let Some(found) = candidates.iter().find(|c| c.exists()) {
+            files.push(found.clone());
         } else {
-            eprintln!("wolfproxy: include '{}' inside a server block refers to a file that does not exist", resolved.display());
-            Vec::new()
-        };
+            eprintln!("wolfproxy: include '{}' inside a server block refers to a file that does not exist", path);
+        }
         // Deterministic, nginx-like lexical order regardless of glob() ordering.
         files.sort();
         for f in files {
@@ -538,7 +578,7 @@ fn expand_server_includes(body: &str, base_dir: Option<&Path>, depth: usize) -> 
                         continue;
                     }
                     let child_base = f.parent().unwrap_or(base);
-                    out.push_str(&expand_server_includes(&stripped, Some(child_base), depth + 1));
+                    out.push_str(&expand_server_includes(&stripped, Some(child_base), prefix, depth + 1));
                     if !out.ends_with('\n') { out.push('\n'); }
                 }
                 Err(e) => eprintln!("wolfproxy: could not read server include '{}': {}", f.display(), e),
@@ -548,7 +588,7 @@ fn expand_server_includes(body: &str, base_dir: Option<&Path>, depth: usize) -> 
     out
 }
 
-fn parse_server_blocks(content: &str, base_dir: Option<&Path>) -> Vec<ServerBlock> {
+fn parse_server_blocks(content: &str, base_dir: Option<&Path>, prefix: Option<&Path>) -> Vec<ServerBlock> {
     let mut servers = Vec::new();
     
     // Find server blocks - this is simplified and may need improvement for nested braces
@@ -585,7 +625,7 @@ fn parse_server_blocks(content: &str, base_dir: Option<&Path>) -> Vec<ServerBloc
                 // End of server block. Expand any `include`s textually first so
                 // included location/if blocks and directives parse in the server
                 // context (nginx's textual-include semantics).
-                let expanded = expand_server_includes(&server_content, base_dir, 0);
+                let expanded = expand_server_includes(&server_content, base_dir, prefix, 0);
                 if let Some(server) = parse_server_content(&expanded) {
                     servers.push(server);
                 }
@@ -1144,9 +1184,10 @@ fn merge_configs(main: &mut NginxConfig, other: NginxConfig) {
 pub fn load_nginx_config(nginx_dir: &Path) -> NginxConfig {
     let main = nginx_dir.join("root.conf");
     if main.is_file() {
-        // parse_nginx_config sets base_dir = nginx_dir, so the main file's
-        // includes resolve exactly like nginx, recursively.
-        return parse_nginx_config(&main);
+        // The config-root prefix is nginx_dir, so a relative include resolves
+        // both against the including file's dir and against nginx_dir — exactly
+        // like nginx, recursively (see include_candidate_paths).
+        return parse_nginx_config_in(&main, Some(nginx_dir));
     }
     // No main config — fall back to auto-scanning sites-enabled/ + conf.d/
     // (the original WolfProxy behaviour; kept so nothing breaks on upgrade).
@@ -1164,7 +1205,9 @@ pub fn load_nginx_sites(nginx_dir: &Path) -> NginxConfig {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_file() {
-                    let sub_config = parse_nginx_config(&path);
+                    // prefix = nginx_dir so relative includes inside these site
+                    // files (e.g. `include snippets/ssl.conf;`) resolve like nginx.
+                    let sub_config = parse_nginx_config_in(&path, Some(nginx_dir));
                     merge_configs(&mut config, sub_config);
                 }
             }
@@ -1178,7 +1221,7 @@ pub fn load_nginx_sites(nginx_dir: &Path) -> NginxConfig {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.extension().is_some_and(|ext| ext == "conf") {
-                    let sub_config = parse_nginx_config(&path);
+                    let sub_config = parse_nginx_config_in(&path, Some(nginx_dir));
                     merge_configs(&mut config, sub_config);
                 }
             }
@@ -1400,5 +1443,61 @@ mod tests {
         // The nested `server { }` must NOT fold its directives into app.
         assert!(!srv.locations.iter().any(|l| l.proxy_pass.as_deref().is_some_and(|p| p.contains("6666"))),
             "a server{{}}-containing include must be skipped, not folded into the outer server");
+    }
+
+    #[test]
+    fn test_prefix_relative_include_resolves_like_nginx() {
+        // wabil 2026-06-14: a relative include written the nginx way — relative
+        // to the config ROOT (/etc/nginx), not to the including file's own dir.
+        // root.conf pulls in sites/app.conf; that server block does
+        // `include snippets/loc.conf;`. The snippets dir lives at the PREFIX
+        // (root/snippets), NOT under sites/. Before the prefix-aware resolution
+        // this resolved to root/sites/snippets/loc.conf (missing) and the
+        // location was silently dropped; now it must load.
+        let dir = std::env::temp_dir().join(format!("wp-prefixinc-{}", std::process::id()));
+        let sites = dir.join("sites");
+        let snippets = dir.join("snippets");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&sites).unwrap();
+        fs::create_dir_all(&snippets).unwrap();
+        fs::write(dir.join("root.conf"), "http {\n    include sites/app.conf;\n}\n").unwrap();
+        // Server-block include written relative to the prefix, not to sites/.
+        fs::write(sites.join("app.conf"),
+            "server {\n    listen 80;\n    server_name app.example.com;\n    include snippets/loc.conf;\n}\n").unwrap();
+        fs::write(snippets.join("loc.conf"),
+            "location /api/ {\n    proxy_pass http://127.0.0.1:9000;\n}\n").unwrap();
+
+        let config = load_nginx_config(&dir);
+        let _ = fs::remove_dir_all(&dir);
+        let srv = config.servers.iter()
+            .find(|s| s.server_names.iter().any(|n| n == "app.example.com"))
+            .expect("server app.example.com should parse");
+        assert!(srv.locations.iter().any(|l| l.proxy_pass.as_deref().is_some_and(|p| p.contains("9000"))),
+            "a prefix-relative server-block include should resolve against the config root; got {:?}",
+            srv.locations.iter().map(|l| &l.proxy_pass).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_prefix_relative_toplevel_include_no_double_load() {
+        // A top-level include reachable BOTH relative-to-file and relative-to-
+        // prefix (here the two are the same directory) must load each server
+        // exactly once — the de-dup by canonical path guards against that.
+        let dir = std::env::temp_dir().join(format!("wp-dedup-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // root.conf is in `dir`, and the include is relative — so base_dir (dir)
+        // and prefix (dir) resolve to the same files. Must not double-count.
+        fs::write(dir.join("root.conf"), "http {\n    include parts/*.conf;\n}\n").unwrap();
+        let parts = dir.join("parts");
+        fs::create_dir_all(&parts).unwrap();
+        fs::write(parts.join("one.conf"),
+            "server {\n    listen 80;\n    server_name dedup.example.com;\n}\n").unwrap();
+
+        let config = load_nginx_config(&dir);
+        let _ = fs::remove_dir_all(&dir);
+        let count = config.servers.iter()
+            .filter(|s| s.server_names.iter().any(|n| n == "dedup.example.com"))
+            .count();
+        assert_eq!(count, 1, "server reachable via identical base+prefix roots must load once, not {}", count);
     }
 }
