@@ -261,6 +261,131 @@ fn is_common_connection_error(err: &dyn std::error::Error) -> bool {
     s.contains("certificate")
 }
 
+/// Actionable hint for a listener bind failure. `Address in use` and
+/// `Permission denied` are the two that actually happen in the field, and they
+/// need OPPOSITE advice: sudo fixes a privileged-port EACCES but does nothing
+/// for an EADDRINUSE where another process already holds the port. The old
+/// blanket "try running with sudo or use ports > 1024" sent klasSponsor (2026-06)
+/// the wrong way when wolfproxy couldn't bind :80 because another listener
+/// already had it. For EADDRINUSE we go further and name the process that holds
+/// the port (klasSponsor: "tell the user what IS running on port 80").
+fn bind_failure_hint(e: &std::io::Error, addr: &SocketAddr) -> String {
+    match e.kind() {
+        std::io::ErrorKind::AddrInUse => {
+            let port = addr.port();
+            let who = match identify_port_holder(port) {
+                Some(h) => format!("port {} is already held by {}. ", port, h),
+                None => format!(
+                    "port {} is already in use (holder not identifiable from /proc — \
+                     try `ss -ltnp 'sport = :{}'`). ", port, port),
+            };
+            format!(
+                "{}Stop that process or move this site to a free port. A site configured \
+                 for SSL on port 80 is almost certainly a misconfiguration — plain HTTP \
+                 belongs on 80, HTTPS/SSL on 443",
+                who)
+        }
+        std::io::ErrorKind::PermissionDenied =>
+            "permission denied binding a privileged port (<1024) — run wolfproxy as root, \
+             or use a port above 1024".to_string(),
+        _ => "verify the host/port in your config and that the address is free".to_string(),
+    }
+}
+
+/// Best-effort: identify which process(es) are LISTENING on `port`, by reading
+/// `/proc` directly. Pure parsing — no `ss`/`lsof` dependency — so it works on
+/// minimal images that ship neither. Returns e.g. `"nginx (pid 1234)"` or
+/// `"nginx (pid 1234), docker-proxy (pid 5678)"`; None if nothing matches or
+/// /proc is unreadable. Runs only on a bind failure (startup, rare), so the
+/// full /proc walk is fine. wolfproxy runs as root, so it can read every
+/// process's fd table and resolve the owning PID.
+fn identify_port_holder(port: u16) -> Option<String> {
+    use std::collections::HashSet;
+
+    // 1. Collect the socket inodes of LISTEN sockets bound to `port` (v4 + v6).
+    //    /proc/net/tcp columns: sl local_address rem_address st ... inode ...
+    //    local_address is "HEXIP:HEXPORT", st "0A" == TCP_LISTEN, inode is col 9.
+    let mut inodes: HashSet<u64> = HashSet::new();
+    for path in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        for line in content.lines().skip(1) {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if f.len() < 10 || f[3] != "0A" {
+                continue;
+            }
+            let hexport = match f[1].rsplit_once(':') {
+                Some((_, hp)) => hp,
+                None => continue,
+            };
+            match u16::from_str_radix(hexport, 16) {
+                Ok(p) if p == port => {
+                    if let Ok(ino) = f[9].parse::<u64>() {
+                        inodes.insert(ino);
+                    }
+                }
+                _ => continue,
+            }
+        }
+    }
+    if inodes.is_empty() {
+        return None;
+    }
+
+    // 2. Walk /proc/<pid>/fd; a symlink target of "socket:[<inode>]" whose inode
+    //    is in the set tells us this PID owns the listening socket.
+    let mut holders: Vec<(u32, String)> = Vec::new();
+    let procs = std::fs::read_dir("/proc").ok()?;
+    for entry in procs.flatten() {
+        let pid = match entry.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) {
+            Some(p) => p,
+            None => continue,
+        };
+        let fds = match std::fs::read_dir(format!("/proc/{}/fd", pid)) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        let mut matched = false;
+        for fd in fds.flatten() {
+            if let Ok(target) = std::fs::read_link(fd.path()) {
+                if let Some(ino) = target
+                    .to_str()
+                    .and_then(|t| t.strip_prefix("socket:["))
+                    .and_then(|t| t.strip_suffix(']'))
+                    .and_then(|n| n.parse::<u64>().ok())
+                {
+                    if inodes.contains(&ino) {
+                        matched = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if matched {
+            let comm = std::fs::read_to_string(format!("/proc/{}/comm", pid))
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "?".to_string());
+            holders.push((pid, comm));
+        }
+    }
+    if holders.is_empty() {
+        return None;
+    }
+    holders.sort_by_key(|(pid, _)| *pid);
+    holders.dedup_by_key(|(pid, _)| *pid);
+    Some(
+        holders
+            .iter()
+            .map(|(pid, comm)| format!("{} (pid {})", comm, pid))
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
+}
+
 /// Print CLI usage. Operators mostly reach this via `--help` or a typo.
 fn print_usage(prog: &str) {
     println!(
@@ -677,7 +802,7 @@ password = "admin"
                     }
                 }
                 Err(e) => {
-                    error!("Failed to bind HTTP to {}: {} (try running with sudo or use ports > 1024)", addr, e);
+                    error!("Failed to bind HTTP to {}: {} — {}", addr, e, bind_failure_hint(&e, &addr));
                 }
             }
         }));
@@ -710,7 +835,7 @@ password = "admin"
                         l
                     }
                     Err(e) => {
-                        error!("Failed to bind HTTPS to {}: {} (try running with sudo or use ports > 1024)", addr, e);
+                        error!("Failed to bind HTTPS to {}: {} — {}", addr, e, bind_failure_hint(&e, &addr));
                         return;
                     }
                 };
