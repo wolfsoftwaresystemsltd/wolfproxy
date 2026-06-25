@@ -496,6 +496,119 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAnyUpstreamCert {
     }
 }
 
+/// Landing page written to the default web root when wolfproxy scaffolds a
+/// fresh nginx tree. Plain, self-contained, no external assets.
+const DEFAULT_INDEX_HTML: &str = r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WolfProxy</title>
+<style>
+  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#0f1117;color:#e6e6e6;margin:0;display:flex;min-height:100vh;align-items:center;justify-content:center}
+  .card{max-width:540px;padding:40px;text-align:center}
+  h1{font-size:28px;margin:0 0 8px}
+  p{color:#9aa0aa;line-height:1.6}
+  code{background:#1b1f2a;padding:2px 6px;border-radius:4px;color:#cbd2dc}
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>🐺 WolfProxy is running</h1>
+    <p>This is the default site. WolfProxy created it because no nginx
+       configuration was found. Drop your own site files into
+       <code>/etc/nginx/sites-enabled/</code> (or <code>conf.d/</code>) and reload,
+       or manage sites from the WolfStack dashboard.</p>
+  </div>
+</body>
+</html>
+"#;
+
+/// Default catch-all site written to `sites-available/default` and
+/// `sites-enabled/default`. Plain HTTP on :80 (no TLS — there are no certs on a
+/// fresh box), serving the default web root.
+const DEFAULT_SITE_CONF: &str = r#"# Default site created by WolfProxy when no nginx config was present.
+# Safe to edit or delete once you add your own sites.
+server {
+    listen 80 default_server;
+    server_name _;
+    root /var/www/html;
+    index index.html index.htm;
+
+    location / {
+        try_files $uri $uri/ =404;
+    }
+}
+"#;
+
+/// True if `dir` contains at least one entry matching `want` (a predicate on the
+/// path). False if the directory is missing or unreadable.
+fn dir_has<F: Fn(&Path) -> bool>(dir: &Path, want: F) -> bool {
+    match std::fs::read_dir(dir) {
+        Ok(entries) => entries.flatten().any(|e| want(&e.path())),
+        Err(_) => false,
+    }
+}
+
+/// Lay down a minimal standard nginx tree when the config dir has no usable
+/// configuration — the common case when wolfproxy is installed WITHOUT nginx
+/// (klasSponsor 2026-06: no nginx files at all, so wolfproxy started with zero
+/// sites and behaved oddly). Creates the directory, `conf.d/`,
+/// `sites-available/`, `sites-enabled/`, a default web root with a landing page,
+/// and a default HTTP site on :80.
+///
+/// NEVER overwrites anything: it only runs when there is no `root.conf`, no file
+/// in `sites-enabled/`, and no `*.conf` in `conf.d/`, and every individual write
+/// is guarded by an existence check. An install that already has nginx files is
+/// left completely untouched (Golden Rule). Best-effort and non-fatal — a
+/// failure is logged and wolfproxy still starts (falling back to its
+/// `http_port` default). Returns Ok(true) if a scaffold was written.
+fn ensure_nginx_scaffold(nginx_dir: &Path) -> std::io::Result<bool> {
+    ensure_nginx_scaffold_in(nginx_dir, Path::new("/var/www/html"))
+}
+
+/// Core of [`ensure_nginx_scaffold`] with the web root injected so it can be
+/// unit-tested without touching the real `/var/www/html`.
+fn ensure_nginx_scaffold_in(nginx_dir: &Path, webroot: &Path) -> std::io::Result<bool> {
+    use std::fs;
+
+    // Already has loadable config (matches what load_nginx_config looks for)? Leave it.
+    let has_root = nginx_dir.join("root.conf").is_file();
+    let has_sites = dir_has(&nginx_dir.join("sites-enabled"), |p| p.is_file());
+    let has_confd = dir_has(&nginx_dir.join("conf.d"), |p| {
+        p.extension().is_some_and(|e| e == "conf")
+    });
+    if has_root || has_sites || has_confd {
+        return Ok(false);
+    }
+
+    // Standard nginx directory layout.
+    fs::create_dir_all(nginx_dir.join("conf.d"))?;
+    fs::create_dir_all(nginx_dir.join("sites-available"))?;
+    fs::create_dir_all(nginx_dir.join("sites-enabled"))?;
+
+    // Default web root + landing page (best-effort — a missing /var/www is not fatal).
+    let _ = fs::create_dir_all(webroot);
+    let index = webroot.join("index.html");
+    if !index.exists() {
+        let _ = fs::write(&index, DEFAULT_INDEX_HTML);
+    }
+
+    // Default site in sites-available, and the same content in sites-enabled so
+    // the auto-scan loads it. A plain file (not a symlink) is robust across
+    // filesystems and is exactly what load_nginx_sites() reads.
+    let available = nginx_dir.join("sites-available/default");
+    if !available.exists() {
+        fs::write(&available, DEFAULT_SITE_CONF)?;
+    }
+    let enabled = nginx_dir.join("sites-enabled/default");
+    if !enabled.exists() {
+        fs::write(&enabled, DEFAULT_SITE_CONF)?;
+    }
+
+    Ok(true)
+}
+
 #[tokio::main]
 async fn main() {
     // Parse CLI args BEFORE the banner, before tracing, and crucially before
@@ -591,8 +704,26 @@ password = "admin"
         }
     };
     
+    // If wolfproxy was installed without nginx there may be no config tree at
+    // all, leaving it with zero sites. Lay down a default nginx structure +
+    // catch-all HTTP site so we start from a sane baseline. Never overwrites
+    // existing files (Golden Rule); non-fatal if it can't write.
+    match ensure_nginx_scaffold(Path::new(&config.nginx.config_dir)) {
+        Ok(true) => info!(
+            "No nginx config found in {} — created a default nginx site structure \
+             (sites-available/default + sites-enabled/default on :80, root /var/www/html)",
+            config.nginx.config_dir
+        ),
+        Ok(false) => {}
+        Err(e) => warn!(
+            "Could not create default nginx structure in {}: {} — starting with \
+             whatever config is present",
+            config.nginx.config_dir, e
+        ),
+    }
+
     info!("Loading nginx configuration from {}", config.nginx.config_dir);
-    
+
     // Load nginx configuration
     let nginx_config = nginx::load_nginx_config(Path::new(&config.nginx.config_dir));
     
@@ -1888,5 +2019,68 @@ async fn serve_static_file(
             error!("Failed to read file {:?}: {}", path, e);
             (StatusCode::INTERNAL_SERVER_ERROR, "Failed to read file").into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod scaffold_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // Unique temp dir without rand/Date (both unavailable/forbidden): pid + counter.
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+    fn unique_dir(tag: &str) -> std::path::PathBuf {
+        let n = SEQ.fetch_add(1, Ordering::SeqCst);
+        let p = std::env::temp_dir().join(format!("wp-scaffold-{}-{}-{}", tag, std::process::id(), n));
+        let _ = std::fs::remove_dir_all(&p);
+        p
+    }
+
+    #[test]
+    fn scaffolds_a_loadable_default_site_when_empty() {
+        let nginx_dir = unique_dir("nginx");
+        let webroot = unique_dir("www");
+        std::fs::create_dir_all(&nginx_dir).unwrap();
+
+        // First run creates the tree.
+        let created = ensure_nginx_scaffold_in(&nginx_dir, &webroot).unwrap();
+        assert!(created, "expected scaffold to be written on an empty dir");
+        assert!(nginx_dir.join("conf.d").is_dir());
+        assert!(nginx_dir.join("sites-available").is_dir());
+        assert!(nginx_dir.join("sites-enabled/default").is_file());
+        assert!(webroot.join("index.html").is_file());
+
+        // The default site must actually parse into a usable HTTP:80 server.
+        let cfg = nginx::load_nginx_config(&nginx_dir);
+        assert!(!cfg.servers.is_empty(), "default site should yield a server block");
+        let has_http_80 = cfg.servers.iter().any(|s| {
+            s.listen.iter().any(|l| l.port == 80 && !l.ssl)
+        });
+        assert!(has_http_80, "default site should listen on plain HTTP :80");
+
+        // Idempotent: a second run sees sites-enabled/default and does nothing.
+        let again = ensure_nginx_scaffold_in(&nginx_dir, &webroot).unwrap();
+        assert!(!again, "expected no re-scaffold once a default site exists");
+
+        let _ = std::fs::remove_dir_all(&nginx_dir);
+        let _ = std::fs::remove_dir_all(&webroot);
+    }
+
+    #[test]
+    fn never_touches_an_existing_config() {
+        let nginx_dir = unique_dir("nginx-existing");
+        let webroot = unique_dir("www-existing");
+        std::fs::create_dir_all(nginx_dir.join("sites-enabled")).unwrap();
+        // An operator's own site already present.
+        std::fs::write(nginx_dir.join("sites-enabled/mysite"), "server { listen 8080; }\n").unwrap();
+
+        let created = ensure_nginx_scaffold_in(&nginx_dir, &webroot).unwrap();
+        assert!(!created, "must not scaffold when a site already exists");
+        // We must NOT have written our default alongside theirs.
+        assert!(!nginx_dir.join("sites-enabled/default").exists());
+        assert!(!nginx_dir.join("sites-available/default").exists());
+
+        let _ = std::fs::remove_dir_all(&nginx_dir);
+        let _ = std::fs::remove_dir_all(&webroot);
     }
 }
